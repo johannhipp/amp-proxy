@@ -1,0 +1,30 @@
+# Binaries
+bin/
+dist/
+amp-proxy
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of coverage
+*.out
+*.cover
+
+# Go workspace file
+go.work
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
