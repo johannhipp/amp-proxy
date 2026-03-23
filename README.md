@@ -1,114 +1,81 @@
 # amp-proxy
 
-A lightweight conditional HTTP proxy server written in Go. Routes incoming requests to a target server, with the ability to block or conditionally forward requests based on custom matching rules.
+Use your existing Claude Max, ChatGPT Plus, or Gemini subscriptions with [Amp](https://ampcode.com) through [vibeproxy](https://github.com/automazeio/vibeproxy). No API keys, no credits.
 
-## Features
+The problem: when you point Amp at vibeproxy (`amp.url`), *all* traffic goes there -- auth, GitHub, threads, settings, everything. Most of that breaks. amp-proxy sits in the middle and sends each request where it actually needs to go.
 
-- Fast HTTP request proxying
-- Rule-based request matching (priority-ordered)
-- Block or reject specific requests
-- Conditional routing based on request properties
-- Environment variable configuration
-- Zero-dependency core proxy logic
-
-## Architecture
-
-- **config.go** - Configuration and rule definitions
-- **proxy.go** - Reverse proxy handler and request routing
-- **main.go** - Server startup and CLI
-- **go.mod** - Go module definition
-
-## Configuration
-
-### Default Rules
-
-1. **block-admin** (Priority 100)
-   - Blocks requests to `/admin` and `/admin/*`
-   - Target: empty (rejected)
-
-2. **auth-required** (Priority 90)
-   - Routes `/private` and `/private/*` to default target
-   - Can be extended to check Authorization header
-
-### Custom Configuration
-
-Edit `config.go` to add custom rules:
-
-```go
-{
-    Name: "api-v2",
-    Match: func(r *http.Request) bool {
-        return r.Header.Get("X-API-Version") == "2"
-    },
-    Target: "http://api-v2.example.com",
-    Priority: 80,
-}
+```
+Amp CLI
+  │
+  ▼
+amp-proxy (:18317)
+  │
+  ├── /api/provider/*  ──►  vibeproxy (:8317)   LLM calls
+  ├── /v1/*, /api/v1/* ──►  vibeproxy (:8317)   LLM streaming
+  ├── /auth/*          ──►  ampcode.com          OAuth (302 redirect)
+  └── everything else  ──►  ampcode.com          threads, settings, GitHub, etc.
 ```
 
-## Usage
+## Setup
 
-### Start with defaults
 ```bash
-make run
+# build
+make build
+
+# run (defaults: listen on :18317, vibeproxy on :8317)
+./bin/amp-proxy
+
+# or with custom targets
+./bin/amp-proxy --port 18317 --vibeproxy http://localhost:8317 --ampcode https://ampcode.com
 ```
 
-### Start with custom options
+Point Amp at the proxy:
+
 ```bash
-go run . -port 8080 -addr 127.0.0.1 -target http://localhost:9000
+echo '{"amp.url": "http://localhost:18317"}' > ~/.config/amp/settings.json
 ```
 
-### Environment variables
+You'll also need the Amp API key registered for this URL. Copy your existing key:
+
 ```bash
-LISTEN_PORT=8080 LISTEN_ADDR=127.0.0.1 DEFAULT_TARGET=http://localhost:9000 go run .
+# check your existing keys
+cat ~/.local/share/amp/secrets.json
+
+# add an entry for the proxy URL (same key, different URL)
 ```
 
-### Test the proxy
-```bash
-# Request that gets proxied to default target
-curl -i http://localhost:3000/api/users
+## Model remapping
 
-# Request that gets blocked
-curl -i http://localhost:3000/admin
+If you don't have a subscription for every provider Amp uses, amp-proxy can swap unsupported models for ones you do have access to. When Amp requests a Gemini model (and you don't have Google OAuth in vibeproxy), the proxy translates the request to a supported provider automatically.
 
-# Request that requires auth (currently always proxies, can add auth check)
-curl -i http://localhost:3000/private
+Default mappings in `remap.go`:
+
+| Amp requests | Gets served by | Provider |
+|---|---|---|
+| gemini-3-flash-preview | claude-sonnet-4-6 | Anthropic |
+| gemini-3-flash | claude-sonnet-4-6 | Anthropic |
+| gemini-3-pro | gpt-5.4 | OpenAI |
+| gemini-3-pro-image | gpt-image-1 | OpenAI |
+| anything else unsupported | claude-sonnet-4-6 | Anthropic |
+
+The translation handles request/response format conversion between Google GenAI, Anthropic Messages, and OpenAI Chat Completions APIs. Streaming works too.
+
+To change the mappings, edit the `modelMappings` slice in `remap.go`. Unmapped models fall back to Sonnet 4.6 with a warning in the logs so you know what to add.
+
+## Logging
+
+Every request gets logged with a request ID, headers (auth redacted), JSON body previews, route decisions, and response timing. Useful for figuring out what Amp is actually doing.
+
+```
+[0014] REQUEST  POST /api/provider/google/.../gemini-3-flash-preview:generateContent
+[0014] REMAP    google/gemini-3-flash-preview -> anthropic/claude-sonnet-4-6
+[0014] RESPONSE REMAP     200 OK (928ms)
 ```
 
 ## Development
 
 ```bash
-make dev       # Run with hot-reload (requires CompileDaemon)
-make build     # Build binary
-make test      # Run tests
-make fmt       # Format code
-make vet       # Run linter
+make test    # run tests
+make dev     # run without building
+make fmt     # format code
 ```
-
-## How It Works
-
-1. Request arrives at proxy
-2. Rules evaluated in priority order (highest first)
-3. First matching rule determines target
-4. If target is empty string, request is blocked (403)
-5. Otherwise, request is forwarded via reverse proxy
-6. Response returned to client
-
-## Extending
-
-To add new matching logic, modify the `Rule` definitions in `config.go`:
-
-```go
-Rule{
-    Name: "custom-rule",
-    Match: func(r *http.Request) bool {
-        // Your matching logic
-        return r.Header.Get("Custom-Header") == "value"
-    },
-    Target: "http://target.example.com",
-    Priority: 50,
-}
-```
-
-Target URLs can be:
-- Full HTTP/HTTPS URLs: `http://localhost:3001`
-- Empty string (block request): `""`
