@@ -10,7 +10,7 @@ import (
 func translateGoogleToAnthropic(googleReq map[string]interface{}, model string, streaming bool) ([]byte, error) {
 	anthropicReq := map[string]interface{}{
 		"model":      model,
-		"max_tokens": 8192,
+		"max_tokens": 16384,
 	}
 
 	if streaming {
@@ -44,7 +44,13 @@ func translateGoogleToAnthropic(googleReq map[string]interface{}, model string, 
 	// Generation config
 	if genConfig, ok := googleReq["generationConfig"].(map[string]interface{}); ok {
 		if maxTokens, ok := genConfig["maxOutputTokens"].(float64); ok {
-			anthropicReq["max_tokens"] = int(maxTokens)
+			mt := int(maxTokens)
+			// Cap to Anthropic model limits:
+			// Opus 4.6: 128k, Sonnet 4.6: 64k, Haiku 4.5: 64k
+			if mt > 64000 {
+				mt = 64000
+			}
+			anthropicReq["max_tokens"] = mt
 		}
 		if temp, ok := genConfig["temperature"].(float64); ok {
 			anthropicReq["temperature"] = temp

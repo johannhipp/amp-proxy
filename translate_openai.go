@@ -41,7 +41,11 @@ func translateGoogleToOpenAI(googleReq map[string]interface{}, model string, str
 	// Generation config
 	if genConfig, ok := googleReq["generationConfig"].(map[string]interface{}); ok {
 		if maxTokens, ok := genConfig["maxOutputTokens"].(float64); ok {
-			openaiReq["max_tokens"] = int(maxTokens)
+			mt := int(maxTokens)
+			if mt > 64000 {
+				mt = 64000
+			}
+			openaiReq["max_tokens"] = mt
 		}
 		if temp, ok := genConfig["temperature"].(float64); ok {
 			openaiReq["temperature"] = temp

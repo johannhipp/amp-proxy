@@ -22,9 +22,9 @@ type ModelMapping struct {
 }
 
 var modelMappings = []ModelMapping{
-	// Gemini flash variants -> Claude Haiku
-	{SourcePattern: "gemini-3-flash-preview", TargetModel: "claude-haiku-4-5-20251001", TargetProvider: "anthropic", TargetPath: "/api/provider/anthropic/v1/messages"},
-	{SourcePattern: "gemini-3-flash", TargetModel: "claude-haiku-4-5-20251001", TargetProvider: "anthropic", TargetPath: "/api/provider/anthropic/v1/messages"},
+	// Gemini flash variants -> Claude Sonnet 4.6 (latest)
+	{SourcePattern: "gemini-3-flash-preview", TargetModel: "claude-sonnet-4-6", TargetProvider: "anthropic", TargetPath: "/api/provider/anthropic/v1/messages"},
+	{SourcePattern: "gemini-3-flash", TargetModel: "claude-sonnet-4-6", TargetProvider: "anthropic", TargetPath: "/api/provider/anthropic/v1/messages"},
 	// Gemini pro -> GPT 5.4
 	{SourcePattern: "gemini-3-pro", TargetModel: "gpt-5.4", TargetProvider: "openai", TargetPath: "/api/provider/openai/v1/chat/completions"},
 	// Gemini pro image -> GPT image
@@ -33,7 +33,7 @@ var modelMappings = []ModelMapping{
 
 // Fallback for any model we don't explicitly map
 var fallbackMapping = ModelMapping{
-	TargetModel:    "claude-sonnet-4-6-20250929",
+	TargetModel:    "claude-sonnet-4-6",
 	TargetProvider: "anthropic",
 	TargetPath:     "/api/provider/anthropic/v1/messages",
 }

@@ -61,7 +61,16 @@ func NewProxyHandler(config *Config) *ProxyHandler {
 
 		// Use a transport that supports HTTPS
 		proxy.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{},
+			TLSClientConfig:       &tls.Config{},
+			ResponseHeaderTimeout: 5 * time.Minute, // Don't wait forever for upstream
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConnsPerHost:   10,
+		}
+
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("PROXY ERROR for %s %s -> %s: %v\n", r.Method, r.URL.Path, target, err)
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprintf(w, `{"error":"proxy_error","message":"%s"}`, err.Error())
 		}
 
 		handler.proxies[target] = proxy
