@@ -33,6 +33,8 @@ func main() {
 		*vibeproxyURL = v
 	}
 
+	config.ExaAPIKey = os.Getenv("EXA_API_KEY")
+
 	config.ListenPort = *listenPort
 	config.ListenAddr = *listenAddr
 	config.DefaultTarget = *ampcodeURL

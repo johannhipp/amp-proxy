@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -123,6 +124,21 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fake free-tier status so server-side tools (web_search, read_web_page) aren't blocked
+	if r.URL.Path == "/api/internal" && r.URL.RawQuery == "getUserFreeTierStatus" {
+		log.Printf("[%04d] FAKE     getUserFreeTierStatus -> canUseAmpFree:true\n", reqID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"ok":true,"result":{"canUseAmpFree":true,"isDailyGrantEnabled":true}}`)
+		return
+	}
+
+	// Stub server-side tool calls (webSearch2, extractWebPageContent)
+	if r.URL.Path == "/api/internal" && (r.URL.RawQuery == "webSearch2" || r.URL.RawQuery == "extractWebPageContent") {
+		ph.handleToolStub(w, r, reqID)
+		return
+	}
+
 	// Model remapping: intercept unsupported provider requests and translate them
 	if provider, ok := isUnsupportedProviderRequest(r); ok {
 		if model, streaming, isGoogle := parseGoogleProviderRequest(r); isGoogle {
@@ -169,6 +185,209 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	elapsed := time.Since(start)
 	log.Printf("[%04d] RESPONSE %-9s %d %s (%d bytes, %s)\n",
 		reqID, label, rec.statusCode, http.StatusText(rec.statusCode), rec.bytes, elapsed.Round(time.Millisecond))
+}
+
+// handleToolStub intercepts server-side tool calls and routes them to Exa or returns stubs
+func (ph *ProxyHandler) handleToolStub(w http.ResponseWriter, r *http.Request, reqID uint64) {
+	method := r.URL.RawQuery
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[%04d] TOOL     %s: failed to read body: %v\n", reqID, method, err)
+		ph.writeToolError(w, "proxy_error", "failed to read request body")
+		return
+	}
+
+	var req struct {
+		Params struct {
+			Objective  string `json:"objective"`
+			URL        string `json:"url"`
+			MaxResults int    `json:"maxResults"`
+		} `json:"params"`
+	}
+	json.Unmarshal(body, &req)
+
+	if ph.config.ExaAPIKey == "" {
+		log.Printf("[%04d] TOOL     %s: no EXA_API_KEY, returning stub\n", reqID, method)
+		ph.writeToolResult(w, map[string]any{"excerpts": []string{"This tool is not available (EXA_API_KEY not set)"}})
+		return
+	}
+
+	switch method {
+	case "webSearch2":
+		ph.handleExaSearch(w, reqID, req.Params.Objective, req.Params.MaxResults)
+	case "extractWebPageContent":
+		ph.handleExaContents(w, reqID, req.Params.URL, req.Params.Objective)
+	}
+}
+
+func (ph *ProxyHandler) handleExaSearch(w http.ResponseWriter, reqID uint64, objective string, maxResults int) {
+	if maxResults <= 0 {
+		maxResults = 5
+	}
+	log.Printf("[%04d] EXA      webSearch2 objective=%q maxResults=%d\n", reqID, objective, maxResults)
+
+	exaReq := map[string]any{
+		"query":       objective,
+		"type":        "auto",
+		"num_results": maxResults,
+		"contents": map[string]any{
+			"text": map[string]any{
+				"max_characters": 10000,
+			},
+		},
+	}
+
+	result, err := ph.callExa("/search", exaReq)
+	if err != nil {
+		log.Printf("[%04d] EXA      search error: %v\n", reqID, err)
+		ph.writeToolError(w, "exa_error", err.Error())
+		return
+	}
+
+	// Format results for the CLI's expected schema
+	md := ph.formatSearchResults(result)
+	log.Printf("[%04d] EXA      search returned %d results\n", reqID, len(md))
+	ph.writeToolResult(w, map[string]any{
+		"results":                 md,
+		"showParallelAttribution": false,
+	})
+}
+
+func (ph *ProxyHandler) handleExaContents(w http.ResponseWriter, reqID uint64, pageURL string, objective string) {
+	log.Printf("[%04d] EXA      extractWebPageContent url=%q objective=%q\n", reqID, pageURL, objective)
+
+	exaReq := map[string]any{
+		"urls": []string{pageURL},
+		"text": map[string]any{
+			"max_characters": 20000,
+		},
+	}
+
+	result, err := ph.callExa("/contents", exaReq)
+	if err != nil {
+		log.Printf("[%04d] EXA      contents error: %v\n", reqID, err)
+		ph.writeToolError(w, "exa_error", err.Error())
+		return
+	}
+
+	md := ph.formatContentsResults(result)
+	log.Printf("[%04d] EXA      contents returned %d chars\n", reqID, len(md))
+	ph.writeToolResult(w, map[string]any{
+		"excerpts": []string{md},
+	})
+}
+
+func (ph *ProxyHandler) callExa(endpoint string, payload map[string]any) (map[string]any, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", "https://api.exa.ai"+endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", ph.config.ExaAPIKey)
+
+	resp, err := ph.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("exa request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("exa returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+	return result, nil
+}
+
+func (ph *ProxyHandler) formatSearchResults(result map[string]any) []map[string]string {
+	results, ok := result["results"].([]any)
+	if !ok || len(results) == 0 {
+		return nil
+	}
+
+	var out []map[string]string
+	for _, r := range results {
+		item, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		title, _ := item["title"].(string)
+		url, _ := item["url"].(string)
+		text, _ := item["text"].(string)
+
+		if len(text) > 2000 {
+			text = text[:2000] + "..."
+		}
+
+		out = append(out, map[string]string{
+			"title": title,
+			"url":   url,
+			"text":  text,
+		})
+	}
+	return out
+}
+
+func (ph *ProxyHandler) formatContentsResults(result map[string]any) string {
+	results, ok := result["results"].([]any)
+	if !ok || len(results) == 0 {
+		return "Could not extract content from the page."
+	}
+
+	item, ok := results[0].(map[string]any)
+	if !ok {
+		return "Could not extract content from the page."
+	}
+
+	title, _ := item["title"].(string)
+	url, _ := item["url"].(string)
+	text, _ := item["text"].(string)
+
+	var sb strings.Builder
+	if title != "" {
+		fmt.Fprintf(&sb, "# %s\n", title)
+	}
+	if url != "" {
+		fmt.Fprintf(&sb, "URL: %s\n\n", url)
+	}
+	if text != "" {
+		sb.WriteString(text)
+	} else {
+		sb.WriteString("No text content extracted.")
+	}
+	return sb.String()
+}
+
+func (ph *ProxyHandler) writeToolResult(w http.ResponseWriter, result any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":     true,
+		"result": result,
+	})
+}
+
+func (ph *ProxyHandler) writeToolError(w http.ResponseWriter, code string, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":    false,
+		"error": map[string]string{"code": code, "message": message},
+	})
 }
 
 // logRequest logs detailed request information
@@ -262,6 +481,11 @@ func (ph *ProxyHandler) Start() error {
 	log.Printf("  listen:    %s\n", addr)
 	log.Printf("  vibeproxy: %s (LLM provider requests)\n", ph.config.VibeProxyTarget)
 	log.Printf("  ampcode:   %s (everything else)\n", ph.config.DefaultTarget)
+	if ph.config.ExaAPIKey != "" {
+		log.Printf("  exa:       enabled (web_search, read_web_page)\n")
+	} else {
+		log.Printf("  exa:       disabled (set EXA_API_KEY to enable)\n")
+	}
 	log.Println()
 	log.Println("Routing rules (highest priority first):")
 	rules := make([]Rule, len(ph.config.Rules))

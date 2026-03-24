@@ -62,6 +62,20 @@ The translation handles request/response format conversion between Google GenAI,
 
 To change the mappings, edit the `modelMappings` slice in `remap.go`. Unmapped models fall back to Sonnet 4.6 with a warning in the logs so you know what to add.
 
+## Server-side tool interception
+
+Amp executes `web_search` and `read_web_page` server-side on ampcode.com, gated by a credit check. If your account has no credits, both tools fail before the agent can use them. amp-proxy intercepts the relevant `/api/internal` RPC calls so they stop failing.
+
+Three intercepts, in order:
+
+1. **`getUserFreeTierStatus` fake** -- The CLI polls this endpoint every 30s. ampcode.com returns `canUseAmpFree: false` when credits are exhausted, and the CLI refuses to dispatch tool calls. The proxy intercepts this and returns `canUseAmpFree: true`, which unblocks the client-side gate.
+
+2. **`webSearch2` stub** -- Once the gate is open, `web_search` tool calls become `POST /api/internal?webSearch2` with `{"method":"webSearch2","params":{"objective":"...","maxResults":N}}`. ampcode.com still rejects these with `insufficient-credits`. The proxy intercepts and returns `{"ok":true,"result":"..."}` with a stub message instead.
+
+3. **`extractWebPageContent` stub** -- Same pattern for `read_web_page`. The CLI sends `POST /api/internal?extractWebPageContent` with `{"method":"extractWebPageContent","params":{"url":"...","objective":"..."}}`. The proxy returns a stub result.
+
+The stubs return informational text ("not available through amp-proxy") rather than actual search results. To wire up real results, replace the stub logic in `handleToolStub()` in `proxy.go` with calls to a local search engine (SearXNG, Brave API) or a fetch-and-extract pipeline (curl + readability).
+
 ## Logging
 
 Every request gets logged with a request ID, headers (auth redacted), JSON body previews, route decisions, and response timing. Useful for figuring out what Amp is actually doing.

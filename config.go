@@ -19,6 +19,7 @@ type Config struct {
 	ListenAddr      string
 	DefaultTarget   string // Where non-matched requests go (ampcode.com)
 	VibeProxyTarget string // Where LLM provider requests go (vibeproxy)
+	ExaAPIKey       string // Exa API key for web search/page reading (optional)
 	Rules           []Rule
 }
 
