@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
-	"log"
+	"log/slog"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 )
 
 func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+
 	config := NewDefaultConfig()
 
 	// Parse flags
@@ -48,8 +53,12 @@ func main() {
 		}
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	handler := NewProxyHandler(config)
-	if err := handler.Start(); err != nil {
-		log.Fatalf("Failed to start proxy: %v\n", err)
+	if err := handler.Start(ctx); err != nil {
+		slog.Error("failed to start proxy", "error", err)
+		os.Exit(1)
 	}
 }

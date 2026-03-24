@@ -16,6 +16,18 @@ amp-proxy (:18317)
   └── everything else  ──►  ampcode.com          threads, settings, GitHub, etc.
 ```
 
+## Features
+
+- **Request routing** -- LLM calls go to vibeproxy, everything else to ampcode.com
+- **OAuth redirect** -- auth paths get 302'd to ampcode.com so cookies land on the right domain
+- **Model remapping** -- swap unsupported models (Gemini) for ones you have (Claude, GPT), with full request/response translation across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats, including streaming
+- **Web search via Exa** -- intercepts Amp's `web_search` and `read_web_page` server-side tools and routes them through the [Exa API](https://exa.ai) instead of ampcode.com's credit-gated backend
+- **Credit gate bypass** -- fakes `getUserFreeTierStatus` so the CLI doesn't block server-side tool dispatch
+- **Structured logging** -- every request logged with slog (request ID, headers redacted, JSON body previews, route decisions, response timing)
+- **Graceful shutdown** -- SIGINT/SIGTERM trigger a clean drain of in-flight requests (10s timeout)
+- **Health check** -- `/healthz` endpoint for Docker, k8s, or monitoring
+- **Request metrics** -- `/metrics` endpoint with JSON counters per route type
+
 ## Setup
 
 ```bash
@@ -25,7 +37,10 @@ make build
 # run (defaults: listen on :18317, vibeproxy on :8317)
 ./bin/amp-proxy
 
-# or with custom targets
+# with Exa web search enabled
+EXA_API_KEY=your-key ./bin/amp-proxy
+
+# with custom targets
 ./bin/amp-proxy --port 18317 --vibeproxy http://localhost:8317 --ampcode https://ampcode.com
 ```
 
@@ -43,6 +58,8 @@ cat ~/.local/share/amp/secrets.json
 
 # add an entry for the proxy URL (same key, different URL)
 ```
+
+See `.env.example` for all configuration options.
 
 ## Model remapping
 
@@ -64,27 +81,34 @@ To change the mappings, edit the `modelMappings` slice in `remap.go`. Unmapped m
 
 ## Server-side tool interception
 
-Amp executes `web_search` and `read_web_page` server-side on ampcode.com, gated by a credit check. If your account has no credits, both tools fail before the agent can use them. amp-proxy intercepts the relevant `/api/internal` RPC calls so they stop failing.
+Amp executes `web_search` and `read_web_page` server-side on ampcode.com, gated by a credit check. If your account has no credits, both tools fail. amp-proxy intercepts the `/api/internal` RPC calls and routes them to the Exa API instead.
 
 Three intercepts, in order:
 
-1. **`getUserFreeTierStatus` fake** -- The CLI polls this endpoint every 30s. ampcode.com returns `canUseAmpFree: false` when credits are exhausted, and the CLI refuses to dispatch tool calls. The proxy intercepts this and returns `canUseAmpFree: true`, which unblocks the client-side gate.
+1. **`getUserFreeTierStatus` fake** -- The CLI polls this every 30s. ampcode.com returns `canUseAmpFree: false` when credits are exhausted, blocking tool dispatch. The proxy returns `canUseAmpFree: true` to unblock the client-side gate.
 
-2. **`webSearch2` stub** -- Once the gate is open, `web_search` tool calls become `POST /api/internal?webSearch2` with `{"method":"webSearch2","params":{"objective":"...","maxResults":N}}`. ampcode.com still rejects these with `insufficient-credits`. The proxy intercepts and returns `{"ok":true,"result":"..."}` with a stub message instead.
+2. **`webSearch2` → Exa `/search`** -- `web_search` tool calls become `POST /api/internal?webSearch2` with `{"method":"webSearch2","params":{"objective":"...","maxResults":N}}`. The proxy translates this to an Exa search request and returns results in the schema the CLI expects (`result.results[]` with `title`, `url`, `text`).
 
-3. **`extractWebPageContent` stub** -- Same pattern for `read_web_page`. The CLI sends `POST /api/internal?extractWebPageContent` with `{"method":"extractWebPageContent","params":{"url":"...","objective":"..."}}`. The proxy returns a stub result.
+3. **`extractWebPageContent` → Exa `/contents`** -- `read_web_page` calls become `POST /api/internal?extractWebPageContent` with `{"method":"extractWebPageContent","params":{"url":"...","objective":"..."}}`. The proxy fetches the page via Exa and returns content as `result.excerpts[]`.
 
-The stubs return informational text ("not available through amp-proxy") rather than actual search results. To wire up real results, replace the stub logic in `handleToolStub()` in `proxy.go` with calls to a local search engine (SearXNG, Brave API) or a fetch-and-extract pipeline (curl + readability).
+Set `EXA_API_KEY` to enable. Without it, both tools return a stub message instead of failing.
 
 ## Logging
 
-Every request gets logged with a request ID, headers (auth redacted), JSON body previews, route decisions, and response timing. Useful for figuring out what Amp is actually doing.
+Structured logs via `slog`. Every request includes request ID, method, path, route decision, and response timing.
 
 ```
-[0014] REQUEST  POST /api/provider/google/.../gemini-3-flash-preview:generateContent
-[0014] REMAP    google/gemini-3-flash-preview -> anthropic/claude-sonnet-4-6
-[0014] RESPONSE REMAP     200 OK (928ms)
+INFO request reqID=14 method=POST path=/api/provider/anthropic/v1/messages
+INFO route   reqID=14 label=VIBEPROXY method=POST path=/api/provider/anthropic/v1/messages target=http://localhost:8317 rule=provider-to-vibeproxy
+INFO response reqID=14 label=VIBEPROXY status=200 statusText=OK bytes=8450 elapsed=15622ms
 ```
+
+## Endpoints
+
+| Path | Method | Description |
+|------|--------|-------------|
+| `/healthz` | GET | Health check, returns `{"status":"ok"}` |
+| `/metrics` | GET | Request counters (total, vibeproxy, ampcode, remap, exa, errors) |
 
 ## Development
 
@@ -92,4 +116,14 @@ Every request gets logged with a request ID, headers (auth redacted), JSON body 
 make test    # run tests
 make dev     # run without building
 make fmt     # format code
+make vet     # run go vet
+```
+
+## Release
+
+Tag a version and push to trigger a GitHub Actions release with cross-platform binaries:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```

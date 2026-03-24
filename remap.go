@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
@@ -86,15 +86,15 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	start := time.Now()
 
 	if !isExplicit {
-		log.Printf("[%04d] WARNING  unmapped model %q -> falling back to %s/%s. Add an explicit mapping to suppress this warning.\n",
-			reqID, model, mapping.TargetProvider, mapping.TargetModel)
+		slog.Warn("unmapped model, using fallback", "reqID", reqID, "model", model, "targetProvider", mapping.TargetProvider, "targetModel", mapping.TargetModel)
 	}
 
 	// Read the original request body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":"failed to read request body"}`, http.StatusBadRequest)
-		log.Printf("[%04d] ERROR    failed to read body: %v\n", reqID, err)
+		slog.Error("failed to read body", "reqID", reqID, "error", err)
+		ph.metrics.errors.Add(1)
 		return
 	}
 
@@ -102,7 +102,8 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	var googleReq map[string]interface{}
 	if err := json.Unmarshal(body, &googleReq); err != nil {
 		http.Error(w, `{"error":"invalid JSON body"}`, http.StatusBadRequest)
-		log.Printf("[%04d] ERROR    invalid JSON: %v\n", reqID, err)
+		slog.Error("invalid JSON", "reqID", reqID, "error", err)
+		ph.metrics.errors.Add(1)
 		return
 	}
 
@@ -119,7 +120,8 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	}
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"translation failed: %s"}`, err.Error()), http.StatusInternalServerError)
-		log.Printf("[%04d] ERROR    translation failed: %v\n", reqID, err)
+		slog.Error("translation failed", "reqID", reqID, "error", err)
+		ph.metrics.errors.Add(1)
 		return
 	}
 
@@ -155,18 +157,19 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 
 	// Log the translated body for debugging
 	if len(translatedBody) <= 2000 {
-		log.Printf("[%04d] REMAP    translated body: %s\n", reqID, string(translatedBody))
+		slog.Debug("remap translated body", "reqID", reqID, "body", string(translatedBody))
 	} else {
-		log.Printf("[%04d] REMAP    translated body: %s... (%d bytes total)\n", reqID, string(translatedBody[:1000]), len(translatedBody))
+		slog.Debug("remap translated body", "reqID", reqID, "body", string(translatedBody[:1000])+"...", "totalBytes", len(translatedBody))
 	}
 
-	log.Printf("[%04d] REMAP    %s -> %s (stream=%v)\n", reqID, targetURL, mapping.TargetModel, streaming)
+	slog.Info("remap request", "reqID", reqID, "targetURL", targetURL, "model", mapping.TargetModel, "stream", streaming)
 
 	// Make the request
 	resp, err := ph.httpClient.Do(outReq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"upstream request failed: %s"}`, err.Error()), http.StatusBadGateway)
-		log.Printf("[%04d] ERROR    upstream request failed: %v\n", reqID, err)
+		slog.Error("upstream request failed", "reqID", reqID, "error", err)
+		ph.metrics.errors.Add(1)
 		return
 	}
 	defer resp.Body.Close()
@@ -187,7 +190,8 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 
 	// If upstream returned an error, log it and pass it through
 	if resp.StatusCode >= 400 {
-		log.Printf("[%04d] ERROR    upstream returned %d: %s\n", reqID, resp.StatusCode, string(respBody))
+		slog.Error("upstream error", "reqID", reqID, "status", resp.StatusCode, "body", string(respBody))
+		ph.metrics.errors.Add(1)
 		for k, v := range resp.Header {
 			for _, vv := range v {
 				w.Header().Add(k, vv)
@@ -195,8 +199,7 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 		}
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
-		log.Printf("[%04d] RESPONSE REMAP     %d %s (%d bytes, %s)\n",
-			reqID, resp.StatusCode, http.StatusText(resp.StatusCode), len(respBody), time.Since(start).Round(time.Millisecond))
+		slog.Info("response remap", "reqID", reqID, "status", resp.StatusCode, "statusText", http.StatusText(resp.StatusCode), "bytes", len(respBody), "elapsed", time.Since(start).Round(time.Millisecond))
 		return
 	}
 
@@ -218,7 +221,7 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 	}
 	if err != nil {
 		// Fallback: forward raw response
-		log.Printf("[%04d] WARNING  response translation failed: %v, forwarding raw\n", reqID, err)
+		slog.Warn("response translation failed, forwarding raw", "reqID", reqID, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
@@ -228,8 +231,7 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write(translated)
-	log.Printf("[%04d] RESPONSE REMAP     200 OK (%d bytes, %s)\n",
-		reqID, len(translated), time.Since(start).Round(time.Millisecond))
+	slog.Info("response remap", "reqID", reqID, "status", 200, "statusText", "OK", "bytes", len(translated), "elapsed", time.Since(start).Round(time.Millisecond))
 }
 
 func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, mapping ModelMapping, start time.Time) {
@@ -237,8 +239,8 @@ func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *htt
 		respBody, _ := io.ReadAll(resp.Body)
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
-		log.Printf("[%04d] RESPONSE REMAP     %d %s (error, %s)\n",
-			reqID, resp.StatusCode, http.StatusText(resp.StatusCode), time.Since(start).Round(time.Millisecond))
+		slog.Error("response remap error", "reqID", reqID, "status", resp.StatusCode, "statusText", http.StatusText(resp.StatusCode), "elapsed", time.Since(start).Round(time.Millisecond))
+		ph.metrics.errors.Add(1)
 		return
 	}
 
@@ -298,6 +300,5 @@ func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *htt
 		}
 	}
 
-	log.Printf("[%04d] RESPONSE REMAP     200 OK (stream, %d bytes, %s)\n",
-		reqID, totalBytes, time.Since(start).Round(time.Millisecond))
+	slog.Info("response remap stream", "reqID", reqID, "status", 200, "statusText", "OK", "bytes", totalBytes, "elapsed", time.Since(start).Round(time.Millisecond))
 }
