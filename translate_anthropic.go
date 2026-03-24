@@ -106,6 +106,7 @@ func translateGoogleToAnthropic(googleReq map[string]interface{}, model string, 
 func translateGoogleContentsToAnthropicMessages(contents []interface{}) ([]interface{}, error) {
 	var messages []interface{}
 	toolCallCounter := 0
+	tracker := newToolCallTracker()
 
 	for _, c := range contents {
 		content, ok := c.(map[string]interface{})
@@ -135,22 +136,26 @@ func translateGoogleContentsToAnthropicMessages(contents []interface{}) ([]inter
 				})
 			} else if fc, ok := part["functionCall"].(map[string]interface{}); ok {
 				toolCallCounter++
+				translatedToolUseID := fmt.Sprintf("toolu_%06d", toolCallCounter)
+				name, _ := fc["name"].(string)
+				tracker.record(name, translatedToolUseID, extractToolCorrelationID(fc))
 				contentBlocks = append(contentBlocks, map[string]interface{}{
 					"type":  "tool_use",
-					"id":    fmt.Sprintf("toolu_%06d", toolCallCounter),
+					"id":    translatedToolUseID,
 					"name":  fc["name"],
 					"input": fc["args"],
 				})
 			} else if fr, ok := part["functionResponse"].(map[string]interface{}); ok {
-				// Function responses become tool_result blocks
-				// Find the matching tool_use ID by name
+				// Function responses become tool_result blocks.
+				// Prefer explicit correlation IDs when present, otherwise consume FIFO by tool name.
 				name, _ := fr["name"].(string)
 				response := fr["response"]
 				responseJSON, _ := json.Marshal(response)
+				toolUseID := tracker.consume(name, extractToolCorrelationID(fr), "toolu_unknown")
 
 				contentBlocks = append(contentBlocks, map[string]interface{}{
 					"type":        "tool_result",
-					"tool_use_id": findToolUseID(messages, name),
+					"tool_use_id": toolUseID,
 					"content":     string(responseJSON),
 				})
 			} else if inlineData, ok := part["inlineData"].(map[string]interface{}); ok {
@@ -174,33 +179,6 @@ func translateGoogleContentsToAnthropicMessages(contents []interface{}) ([]inter
 	}
 
 	return messages, nil
-}
-
-// findToolUseID walks previous messages to find the tool_use block with the given name
-func findToolUseID(messages []interface{}, name string) string {
-	// Walk backwards through messages to find matching tool_use
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg, ok := messages[i].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		content, ok := msg["content"].([]interface{})
-		if !ok {
-			continue
-		}
-		for _, block := range content {
-			b, ok := block.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if b["type"] == "tool_use" && b["name"] == name {
-				if id, ok := b["id"].(string); ok {
-					return id
-				}
-			}
-		}
-	}
-	return "toolu_unknown"
 }
 
 func translateGoogleToolsToAnthropic(tools []interface{}) []interface{} {

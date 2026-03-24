@@ -124,6 +124,12 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 		ph.metrics.errors.Add(1)
 		return
 	}
+	if err := validateTranslatedToolResults(mapping.TargetProvider, translatedBody); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"translated request validation failed: %s"}`, err.Error()), http.StatusInternalServerError)
+		slog.Error("translated request validation failed", "reqID", reqID, "provider", mapping.TargetProvider, "error", err)
+		ph.metrics.errors.Add(1)
+		return
+	}
 
 	// Build the outbound request to vibeproxy
 	targetURL := ph.config.VibeProxyTarget + mapping.TargetPath
@@ -179,6 +185,98 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	} else {
 		ph.handleStreamingResponse(w, resp, reqID, mapping, start)
 	}
+}
+
+func validateTranslatedToolResults(provider string, translatedBody []byte) error {
+	var translatedReq map[string]interface{}
+	if err := json.Unmarshal(translatedBody, &translatedReq); err != nil {
+		return fmt.Errorf("invalid translated request JSON: %w", err)
+	}
+
+	switch provider {
+	case "anthropic":
+		return validateAnthropicToolResults(translatedReq)
+	case "openai":
+		return validateOpenAIToolResults(translatedReq)
+	default:
+		return nil
+	}
+}
+
+func validateAnthropicToolResults(translatedReq map[string]interface{}) error {
+	messages, ok := translatedReq["messages"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	seenToolResults := make(map[string]struct{})
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		contentBlocks, ok := msg["content"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, rawBlock := range contentBlocks {
+			block, ok := rawBlock.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if blockType, _ := block["type"].(string); blockType != "tool_result" {
+				continue
+			}
+
+			toolUseID, _ := block["tool_use_id"].(string)
+			if toolUseID == "" {
+				return fmt.Errorf("tool_result missing tool_use_id")
+			}
+			if toolUseID == "toolu_unknown" {
+				return fmt.Errorf("tool_result has unresolved tool_use_id")
+			}
+			if _, exists := seenToolResults[toolUseID]; exists {
+				return fmt.Errorf("duplicate tool_result for tool_use_id %q", toolUseID)
+			}
+			seenToolResults[toolUseID] = struct{}{}
+		}
+	}
+
+	return nil
+}
+
+func validateOpenAIToolResults(translatedReq map[string]interface{}) error {
+	messages, ok := translatedReq["messages"].([]interface{})
+	if !ok {
+		return nil
+	}
+
+	seenToolResults := make(map[string]struct{})
+	for _, rawMsg := range messages {
+		msg, ok := rawMsg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if role, _ := msg["role"].(string); role != "tool" {
+			continue
+		}
+
+		toolCallID, _ := msg["tool_call_id"].(string)
+		if toolCallID == "" {
+			return fmt.Errorf("tool message missing tool_call_id")
+		}
+		if toolCallID == "call_unknown" {
+			return fmt.Errorf("tool message has unresolved tool_call_id")
+		}
+		if _, exists := seenToolResults[toolCallID]; exists {
+			return fmt.Errorf("duplicate tool_result for tool_call_id %q", toolCallID)
+		}
+		seenToolResults[toolCallID] = struct{}{}
+	}
+
+	return nil
 }
 
 func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, mapping ModelMapping, start time.Time) {

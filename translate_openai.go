@@ -99,6 +99,7 @@ func translateGoogleToOpenAI(googleReq map[string]interface{}, model string, str
 func translateGoogleContentsToOpenAIMessages(contents []interface{}) ([]interface{}, error) {
 	var messages []interface{}
 	toolCallCounter := 0
+	tracker := newToolCallTracker()
 
 	for _, c := range contents {
 		content, ok := c.(map[string]interface{})
@@ -129,9 +130,12 @@ func translateGoogleContentsToOpenAIMessages(contents []interface{}) ([]interfac
 				textParts = append(textParts, text)
 			} else if fc, ok := part["functionCall"].(map[string]interface{}); ok {
 				toolCallCounter++
+				translatedCallID := fmt.Sprintf("call_%06d", toolCallCounter)
+				name, _ := fc["name"].(string)
+				tracker.record(name, translatedCallID, extractToolCorrelationID(fc))
 				argsJSON, _ := json.Marshal(fc["args"])
 				toolCalls = append(toolCalls, map[string]interface{}{
-					"id":   fmt.Sprintf("call_%06d", toolCallCounter),
+					"id":   translatedCallID,
 					"type": "function",
 					"function": map[string]interface{}{
 						"name":      fc["name"],
@@ -141,9 +145,10 @@ func translateGoogleContentsToOpenAIMessages(contents []interface{}) ([]interfac
 			} else if fr, ok := part["functionResponse"].(map[string]interface{}); ok {
 				responseJSON, _ := json.Marshal(fr["response"])
 				name, _ := fr["name"].(string)
+				toolCallID := tracker.consume(name, extractToolCorrelationID(fr), "call_unknown")
 				toolResults = append(toolResults, map[string]interface{}{
 					"role":         "tool",
-					"tool_call_id": findOpenAIToolCallID(messages, name),
+					"tool_call_id": toolCallID,
 					"content":      string(responseJSON),
 				})
 			}
@@ -172,35 +177,6 @@ func translateGoogleContentsToOpenAIMessages(contents []interface{}) ([]interfac
 	}
 
 	return messages, nil
-}
-
-func findOpenAIToolCallID(messages []interface{}, name string) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg, ok := messages[i].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		toolCalls, ok := msg["tool_calls"].([]interface{})
-		if !ok {
-			continue
-		}
-		for _, tc := range toolCalls {
-			call, ok := tc.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			fn, ok := call["function"].(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if fn["name"] == name {
-				if id, ok := call["id"].(string); ok {
-					return id
-				}
-			}
-		}
-	}
-	return "call_unknown"
 }
 
 func translateGoogleToolsToOpenAI(tools []interface{}) []interface{} {

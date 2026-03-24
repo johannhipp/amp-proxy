@@ -21,6 +21,7 @@ amp-proxy (:18317)
 - **Request routing** -- LLM calls go to vibeproxy, everything else to ampcode.com
 - **OAuth redirect** -- auth paths get 302'd to ampcode.com so cookies land on the right domain
 - **Model remapping** -- swap unsupported models (Gemini) for ones you have (Claude, GPT), with full request/response translation across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats, including streaming
+- **Stable subagent tool translation** -- fixes repeated same-name tool calls (like Finder's multiple `shell_command` steps) by tracking tool call/result IDs one-to-one, preventing duplicate `tool_result` protocol errors
 - **Web search via Exa** -- intercepts Amp's `web_search` and `read_web_page` server-side tools and routes them through the [Exa API](https://exa.ai) instead of ampcode.com's credit-gated backend
 - **Credit gate bypass** -- fakes `getUserFreeTierStatus` so the CLI doesn't block server-side tool dispatch
 - **Structured logging** -- every request logged with slog (request ID, headers redacted, JSON body previews, route decisions, response timing)
