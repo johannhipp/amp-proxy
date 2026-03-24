@@ -1,8 +1,14 @@
 # amp-proxy
 
-Use your existing Claude Max, ChatGPT Plus, or Gemini subscriptions with [Amp](https://ampcode.com) through [vibeproxy](https://github.com/automazeio/vibeproxy). No API keys, no credits.
+## Why
 
-The problem: when you point Amp at vibeproxy (`amp.url`), *all* traffic goes there -- auth, GitHub, threads, settings, everything. Most of that breaks. amp-proxy sits in the middle and sends each request where it actually needs to go.
+I love [Amp](https://ampcode.com) but just not that big of a fan of API billing, and there's this nice MacOS statusbar app called [vibeproxy](https://github.com/automazeio/vibeproxy) that exposes existing Claude Max, ChatGPT Plus, or Gemini subscriptions via an API. So I built [amp-proxy](https://github.com/johannhipp/amp-proxy) which sits in between.
+
+[Doesn't vibeproxy already do this?](https://github.com/automazeio/vibeproxy/blob/main/AMPCODE_SETUP.md). Yes, but only partially. It only works for LLM calls of the providers you've authenticated with in vibeproxy, but 
+
+1) not for other providers and models that amp will request
+2) does not support server-side tools like `web_search` and `read_web_page`, where Amp has its own proprietary implementation
+3) does not support OAuth, which is required for auth, GitHub, threads, settings, etc. and a few other amp-native features. See all [changes needed to make this work](#features).
 
 ```
 Amp CLI
@@ -18,7 +24,7 @@ amp-proxy (:18317)
 
 ## Features
 
-- **Request routing** -- LLM calls go to vibeproxy, everything else to ampcode.com
+- **Request routing** -- LLM calls go to vibeproxy, while auth, threads, and settings stay on ampcode.com
 - **OAuth redirect** -- auth paths get 302'd to ampcode.com so cookies land on the right domain
 - **Model remapping** -- swap unsupported models (Gemini) for ones you have (Claude, GPT), with full request/response translation across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats, including streaming
 - **Stable subagent tool translation** -- fixes repeated same-name tool calls (like Finder's multiple `shell_command` steps) by tracking tool call/result IDs one-to-one, preventing duplicate `tool_result` protocol errors
@@ -120,11 +126,26 @@ make fmt     # format code
 make vet     # run go vet
 ```
 
-## Release
+## Releases
 
-Tag a version and push to trigger a GitHub Actions release with cross-platform binaries:
+Releases are fully automated via [`.github/workflows/release.yml`](.github/workflows/release.yml) and [`.goreleaser.yml`](.goreleaser.yml).
+
+- Push a tag like `v0.1.0` to build and publish a GitHub Release.
+- Run the workflow manually (`workflow_dispatch`) to validate a snapshot release without publishing artifacts.
+
+Tag-based release:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+## Dependency Updates
+
+Renovate is configured in [`.github/renovate.json`](.github/renovate.json) for this repository.
+
+- Go module updates are grouped and run `go mod tidy` after updates.
+- GitHub Actions updates are grouped to reduce PR noise.
+- Major updates are labeled separately for easier review.
+
+To enable it, install the Renovate GitHub App for this repository.
