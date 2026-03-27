@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -95,6 +96,7 @@ type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
 	bytes      int64
+	errBody    []byte // capture body for non-2xx responses
 }
 
 func (rr *responseRecorder) WriteHeader(code int) {
@@ -105,6 +107,9 @@ func (rr *responseRecorder) WriteHeader(code int) {
 func (rr *responseRecorder) Write(b []byte) (int, error) {
 	n, err := rr.ResponseWriter.Write(b)
 	rr.bytes += int64(n)
+	if rr.statusCode >= 300 {
+		rr.errBody = append(rr.errBody, b...)
+	}
 	return n, err
 }
 
@@ -219,12 +224,58 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ruleName := ph.findMatchedRule(r)
 	slog.Info("route", "reqID", reqID, "label", label, "method", r.Method, "path", r.URL.Path, "target", target, "rule", ruleName)
 
+	// Strip unsupported fields from OpenAI requests before forwarding to vibeproxy
+	if label == "VIBEPROXY" && strings.Contains(r.URL.Path, "/openai/") {
+		if err := stripOpenAIUnsupportedFields(r); err != nil {
+			slog.Warn("failed to strip openai fields", "reqID", reqID, "error", err)
+		}
+	}
+
 	// Wrap response writer to capture status/size
 	rec := &responseRecorder{ResponseWriter: w, statusCode: 200}
 	proxy.ServeHTTP(rec, r)
 
 	elapsed := time.Since(start)
-	slog.Info("response", "reqID", reqID, "label", label, "status", rec.statusCode, "statusText", http.StatusText(rec.statusCode), "bytes", rec.bytes, "elapsed", elapsed.Round(time.Millisecond))
+	logAttrs := []any{"reqID", reqID, "label", label, "status", rec.statusCode, "statusText", http.StatusText(rec.statusCode), "bytes", rec.bytes, "elapsed", elapsed.Round(time.Millisecond)}
+	if len(rec.errBody) > 0 {
+		logAttrs = append(logAttrs, "body", string(rec.errBody))
+	}
+	slog.Info("response", logAttrs...)
+}
+
+// stripOpenAIUnsupportedFields removes fields from OpenAI request bodies that
+// vibeproxy doesn't support (e.g. stream_options).
+func stripOpenAIUnsupportedFields(r *http.Request) error {
+	body, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		return err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		// Not JSON, put it back unchanged
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return nil
+	}
+	changed := false
+	for _, key := range []string{"stream_options"} {
+		if _, ok := m[key]; ok {
+			delete(m, key)
+			changed = true
+		}
+	}
+	if !changed {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return nil
+	}
+	modified, err := json.Marshal(m)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(modified))
+	r.ContentLength = int64(len(modified))
+	return nil
 }
 
 // handleToolStub intercepts server-side tool calls and routes them to Exa or returns stubs
