@@ -11,7 +11,11 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	logLevel := &slog.LevelVar{}
+	if os.Getenv("AMP_PROXY_DEBUG") != "" {
+		logLevel.Set(slog.LevelDebug)
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})))
 
 	config := NewDefaultConfig()
 
