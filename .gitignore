@@ -2,6 +2,7 @@
 bin/
 dist/
 amp-proxy
+amp-proxy-v2
 *.exe
 *.dll
 *.so

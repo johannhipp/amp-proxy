@@ -1,13 +1,17 @@
-.PHONY: build run dev clean test
+.PHONY: build run dev clean test fmt vet help
+
+# Build as amp-proxy-v2 to never overwrite the running binary
+BINARY := bin/amp-proxy-v2
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
 build:
-	go build -o bin/amp-proxy .
+	go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) .
 
 run: build
-	./bin/amp-proxy
+	$(BINARY)
 
 dev:
-	go run .
+	go run -ldflags "-X main.version=$(VERSION)" .
 
 clean:
 	rm -rf bin/ dist/
@@ -22,10 +26,10 @@ vet:
 	go vet ./...
 
 help:
-	@echo "amp-proxy - Conditional HTTP Proxy Server"
+	@echo "amp-proxy v2 - Smart proxy for Amp CLI with built-in provider auth"
 	@echo ""
 	@echo "Available commands:"
-	@echo "  make build   - Build the binary"
+	@echo "  make build   - Build the binary (bin/amp-proxy-v2)"
 	@echo "  make run     - Build and run"
 	@echo "  make dev     - Run in development mode"
 	@echo "  make clean   - Clean build artifacts"
