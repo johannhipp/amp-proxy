@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,13 +19,14 @@ import (
 
 // ProxyHandler handles HTTP request routing
 type ProxyHandler struct {
-	config     *Config
-	proxies    map[string]*httputil.ReverseProxy
+	config     *AppConfig
+	gateway    *ProviderGateway
+	ampProxy   *httputil.ReverseProxy
 	httpClient *http.Client
 	requestID  atomic.Uint64
 	metrics    struct {
 		totalRequests atomic.Uint64
-		vibeproxyReqs atomic.Uint64
+		providerReqs  atomic.Uint64
 		ampcodeReqs   atomic.Uint64
 		remapReqs     atomic.Uint64
 		exaReqs       atomic.Uint64
@@ -35,58 +35,40 @@ type ProxyHandler struct {
 }
 
 // NewProxyHandler creates a new proxy handler
-func NewProxyHandler(config *Config) *ProxyHandler {
+func NewProxyHandler(config *AppConfig) *ProxyHandler {
 	handler := &ProxyHandler{
-		config:  config,
-		proxies: make(map[string]*httputil.ReverseProxy),
+		config: config,
 		httpClient: &http.Client{
-			Timeout: 5 * time.Minute, // Long timeout for streaming LLM responses
+			Timeout: 5 * time.Minute,
 		},
 	}
 
-	// Collect all unique targets
-	targets := make(map[string]bool)
-	targets[config.DefaultTarget] = true
-	targets[config.VibeProxyTarget] = true
-	for _, rule := range config.Rules {
-		if rule.Target != "" {
-			targets[rule.Target] = true
-		}
+	// Set up ampcode reverse proxy
+	ampcodeURL, err := url.Parse(config.AmpcodeURL)
+	if err != nil {
+		slog.Error("invalid ampcode URL", "url", config.AmpcodeURL, "error", err)
+		ampcodeURL, _ = url.Parse("https://ampcode.com")
 	}
 
-	for target := range targets {
-		targetURL, err := url.Parse(target)
-		if err != nil {
-			slog.Error("invalid target URL", "target", target, "error", err)
-			continue
-		}
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-		// For HTTPS targets, set the Host header to the target host
-		// so TLS and virtual hosting work correctly.
-		originalDirector := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			originalDirector(req)
-			req.Host = targetURL.Host
-		}
-
-		// Use a transport that supports HTTPS
-		proxy.Transport = &http.Transport{
-			TLSClientConfig:       &tls.Config{},
-			ResponseHeaderTimeout: 5 * time.Minute, // Don't wait forever for upstream
-			IdleConnTimeout:       90 * time.Second,
-			MaxIdleConnsPerHost:   10,
-		}
-
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			slog.Error("proxy error", "method", r.Method, "path", r.URL.Path, "target", target, "error", err)
-			handler.metrics.errors.Add(1)
-			w.WriteHeader(http.StatusBadGateway)
-			fmt.Fprintf(w, `{"error":"proxy_error","message":"%s"}`, err.Error())
-		}
-
-		handler.proxies[target] = proxy
+	ampProxy := httputil.NewSingleHostReverseProxy(ampcodeURL)
+	originalDirector := ampProxy.Director
+	ampProxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Host = ampcodeURL.Host
 	}
+	ampProxy.Transport = &http.Transport{
+		TLSClientConfig:       &tls.Config{},
+		ResponseHeaderTimeout: 5 * time.Minute,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConnsPerHost:   10,
+	}
+	ampProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		slog.Error("ampcode proxy error", "method", r.Method, "path", r.URL.Path, "error", err)
+		handler.metrics.errors.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"error":"proxy_error","message":"%s"}`, err.Error())
+	}
+	handler.ampProxy = ampProxy
 
 	return handler
 }
@@ -96,7 +78,7 @@ type responseRecorder struct {
 	http.ResponseWriter
 	statusCode int
 	bytes      int64
-	errBody    []byte // capture body for non-2xx responses
+	errBody    []byte
 }
 
 func (rr *responseRecorder) WriteHeader(code int) {
@@ -124,7 +106,7 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	reqID := ph.requestID.Add(1)
 	start := time.Now()
 
-	// Health check — don't log
+	// Health check
 	if r.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -132,13 +114,13 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Metrics — don't log
+	// Metrics
 	if r.URL.Path == "/metrics" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]uint64{
 			"total_requests":    ph.metrics.totalRequests.Load(),
-			"vibeproxy_requests": ph.metrics.vibeproxyReqs.Load(),
+			"provider_requests": ph.metrics.providerReqs.Load(),
 			"ampcode_requests":  ph.metrics.ampcodeReqs.Load(),
 			"remap_requests":    ph.metrics.remapReqs.Load(),
 			"exa_requests":      ph.metrics.exaReqs.Load(),
@@ -148,24 +130,18 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ph.metrics.totalRequests.Add(1)
-
-	// Log full request details
 	ph.logRequest(reqID, r)
 
-	// Browser auth paths: redirect to ampcode.com instead of reverse-proxying.
-	// OAuth flows set state/nonce cookies on the origin domain. Reverse-proxying
-	// keeps the browser on localhost:18317 but ampcode's callback goes to
-	// ampcode.com, causing a domain mismatch. A 302 redirect sends the browser
-	// to ampcode.com directly so the entire OAuth round-trip stays on one domain.
+	// Auth redirects — send browser directly to ampcode.com
 	if hasPathPrefix(r.URL.Path, "/auth") || hasPathPrefix(r.URL.Path, "/api/auth") {
-		redirectURL := ph.config.DefaultTarget + r.URL.RequestURI()
+		redirectURL := ph.config.AmpcodeURL + r.URL.RequestURI()
 		slog.Info("redirect", "reqID", reqID, "from", r.URL.RequestURI(), "to", redirectURL)
 		ph.metrics.ampcodeReqs.Add(1)
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 		return
 	}
 
-	// Fake free-tier status so server-side tools (web_search, read_web_page) aren't blocked
+	// Fake free-tier status
 	if r.URL.Path == "/api/internal" && r.URL.RawQuery == "getUserFreeTierStatus" {
 		slog.Info("fake getUserFreeTierStatus", "reqID", reqID)
 		w.Header().Set("Content-Type", "application/json")
@@ -174,77 +150,145 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Stub server-side tool calls (webSearch2, extractWebPageContent)
+	// Tool stubs
 	if r.URL.Path == "/api/internal" && (r.URL.RawQuery == "webSearch2" || r.URL.RawQuery == "extractWebPageContent") {
 		ph.handleToolStub(w, r, reqID)
 		return
 	}
 
-	// Model remapping: intercept unsupported provider requests and translate them
+	// Model remapping: intercept unsupported provider requests and translate
 	if provider, ok := isUnsupportedProviderRequest(r); ok {
 		if model, streaming, isGoogle := parseGoogleProviderRequest(r); isGoogle {
-			mapping, isExplicit := findMapping(model)
-			slog.Info("remap", "reqID", reqID, "from", provider+"/"+model, "to", mapping.TargetProvider+"/"+mapping.TargetModel)
+			remap, isExplicit := ph.config.FindModelRemap(model)
+			slog.Info("remap", "reqID", reqID, "from", provider+"/"+model, "to", remap.Provider+"/"+remap.To)
 			ph.metrics.remapReqs.Add(1)
-			ph.handleRemappedRequest(w, r, reqID, model, streaming, mapping, isExplicit)
+			ph.handleRemappedRequest(w, r, reqID, model, streaming, remap, isExplicit)
 			return
 		}
-		// Non-Google unsupported provider — log warning, fall through to default
-		slog.Warn("unsupported provider, forwarding to vibeproxy", "reqID", reqID, "provider", provider)
+		slog.Warn("unsupported provider, forwarding to gateway", "reqID", reqID, "provider", provider)
 	}
 
-	target := ph.findTarget(r)
+	// Provider requests → embedded CLIProxyAPIPlus
+	if isProviderRequest(r) {
+		ph.metrics.providerReqs.Add(1)
 
-	if target == "" {
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprintf(w, `{"error": "forbidden", "message": "request blocked by proxy rules"}`)
-		slog.Warn("blocked", "reqID", reqID, "method", r.Method, "path", r.URL.Path)
-		ph.metrics.errors.Add(1)
-		return
-	}
-
-	proxy, ok := ph.proxies[target]
-	if !ok {
-		w.WriteHeader(http.StatusBadGateway)
-		fmt.Fprintf(w, `{"error": "bad_gateway", "message": "target not available"}`)
-		slog.Error("no proxy configured", "reqID", reqID, "target", target)
-		ph.metrics.errors.Add(1)
-		return
-	}
-
-	label := "AMPCODE"
-	if target == ph.config.VibeProxyTarget {
-		label = "VIBEPROXY"
-		ph.metrics.vibeproxyReqs.Add(1)
-	} else {
-		ph.metrics.ampcodeReqs.Add(1)
-	}
-
-	// Find which rule matched
-	ruleName := ph.findMatchedRule(r)
-	slog.Info("route", "reqID", reqID, "label", label, "method", r.Method, "path", r.URL.Path, "target", target, "rule", ruleName)
-
-	// Strip unsupported fields from OpenAI requests before forwarding to vibeproxy
-	if label == "VIBEPROXY" && strings.Contains(r.URL.Path, "/openai/") {
-		if err := stripOpenAIUnsupportedFields(r); err != nil {
-			slog.Warn("failed to strip openai fields", "reqID", reqID, "error", err)
+		// Strip unsupported OpenAI fields before forwarding
+		if strings.Contains(r.URL.Path, "/openai/") {
+			if err := stripOpenAIUnsupportedFields(r); err != nil {
+				slog.Warn("failed to strip openai fields", "reqID", reqID, "error", err)
+			}
 		}
+
+		// Strip cache_control from request bodies (prevents 400 via OAuth route)
+		if r.Method == "POST" && r.Body != nil {
+			stripCacheControl(r)
+		}
+
+		slog.Info("route", "reqID", reqID, "label", "PROVIDER", "method", r.Method, "path", r.URL.Path)
+
+		rec := &responseRecorder{ResponseWriter: w, statusCode: 200}
+		ph.gateway.ServeHTTP(rec, r)
+
+		elapsed := time.Since(start)
+		logAttrs := []any{"reqID", reqID, "label", "PROVIDER", "status", rec.statusCode, "statusText", http.StatusText(rec.statusCode), "bytes", rec.bytes, "elapsed", elapsed.Round(time.Millisecond)}
+		if len(rec.errBody) > 0 {
+			logAttrs = append(logAttrs, "body", string(rec.errBody))
+		}
+		slog.Info("response", logAttrs...)
+		return
 	}
 
-	// Wrap response writer to capture status/size
+	// Everything else → ampcode.com
+	ph.metrics.ampcodeReqs.Add(1)
+	slog.Info("route", "reqID", reqID, "label", "AMPCODE", "method", r.Method, "path", r.URL.Path)
+
 	rec := &responseRecorder{ResponseWriter: w, statusCode: 200}
-	proxy.ServeHTTP(rec, r)
+	ph.ampProxy.ServeHTTP(rec, r)
 
 	elapsed := time.Since(start)
-	logAttrs := []any{"reqID", reqID, "label", label, "status", rec.statusCode, "statusText", http.StatusText(rec.statusCode), "bytes", rec.bytes, "elapsed", elapsed.Round(time.Millisecond)}
+	logAttrs := []any{"reqID", reqID, "label", "AMPCODE", "status", rec.statusCode, "statusText", http.StatusText(rec.statusCode), "bytes", rec.bytes, "elapsed", elapsed.Round(time.Millisecond)}
 	if len(rec.errBody) > 0 {
 		logAttrs = append(logAttrs, "body", string(rec.errBody))
 	}
 	slog.Info("response", logAttrs...)
 }
 
-// stripOpenAIUnsupportedFields removes fields from OpenAI request bodies that
-// vibeproxy doesn't support (e.g. stream_options).
+// isProviderRequest checks if this is a provider/LLM request
+func isProviderRequest(r *http.Request) bool {
+	return hasPathPrefix(r.URL.Path, "/api/provider") ||
+		hasPathPrefix(r.URL.Path, "/v1") ||
+		hasPathPrefix(r.URL.Path, "/api/v1")
+}
+
+// hasPathPrefix checks if the request path matches a prefix
+func hasPathPrefix(path, prefix string) bool {
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+// stripCacheControl removes cache_control keys from request JSON bodies
+// This prevents 400 errors when requests go through the OAuth route
+func stripCacheControl(r *http.Request) {
+	if r.Body == nil || r.ContentLength == 0 {
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	if !strings.Contains(ct, "json") {
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(body, &m); err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+
+	changed := removeCacheControl(m)
+	if !changed {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+
+	modified, err := json.Marshal(m)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(modified))
+	r.ContentLength = int64(len(modified))
+}
+
+// removeCacheControl recursively removes cache_control keys from a JSON structure
+func removeCacheControl(v interface{}) bool {
+	changed := false
+	switch val := v.(type) {
+	case map[string]interface{}:
+		if _, ok := val["cache_control"]; ok {
+			delete(val, "cache_control")
+			changed = true
+		}
+		for _, child := range val {
+			if removeCacheControl(child) {
+				changed = true
+			}
+		}
+	case []interface{}:
+		for _, item := range val {
+			if removeCacheControl(item) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// stripOpenAIUnsupportedFields removes unsupported fields from OpenAI request bodies
 func stripOpenAIUnsupportedFields(r *http.Request) error {
 	body, err := io.ReadAll(r.Body)
 	r.Body.Close()
@@ -253,7 +297,6 @@ func stripOpenAIUnsupportedFields(r *http.Request) error {
 	}
 	var m map[string]any
 	if err := json.Unmarshal(body, &m); err != nil {
-		// Not JSON, put it back unchanged
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		return nil
 	}
@@ -278,7 +321,7 @@ func stripOpenAIUnsupportedFields(r *http.Request) error {
 	return nil
 }
 
-// handleToolStub intercepts server-side tool calls and routes them to Exa or returns stubs
+// handleToolStub intercepts server-side tool calls
 func (ph *ProxyHandler) handleToolStub(w http.ResponseWriter, r *http.Request, reqID uint64) {
 	method := r.URL.RawQuery
 
@@ -326,9 +369,7 @@ func (ph *ProxyHandler) handleExaSearch(w http.ResponseWriter, reqID uint64, obj
 		"type":        "auto",
 		"num_results": maxResults,
 		"contents": map[string]any{
-			"text": map[string]any{
-				"max_characters": 10000,
-			},
+			"text": map[string]any{"max_characters": 10000},
 		},
 	}
 
@@ -340,7 +381,6 @@ func (ph *ProxyHandler) handleExaSearch(w http.ResponseWriter, reqID uint64, obj
 		return
 	}
 
-	// Format results for the CLI's expected schema
 	md := ph.formatSearchResults(result)
 	slog.Info("exa search returned", "reqID", reqID, "resultCount", len(md))
 	ph.writeToolResult(w, map[string]any{
@@ -354,9 +394,7 @@ func (ph *ProxyHandler) handleExaContents(w http.ResponseWriter, reqID uint64, p
 
 	exaReq := map[string]any{
 		"urls": []string{pageURL},
-		"text": map[string]any{
-			"max_characters": 20000,
-		},
+		"text": map[string]any{"max_characters": 20000},
 	}
 
 	result, err := ph.callExa("/contents", exaReq)
@@ -369,9 +407,7 @@ func (ph *ProxyHandler) handleExaContents(w http.ResponseWriter, reqID uint64, p
 
 	md := ph.formatContentsResults(result)
 	slog.Info("exa contents returned", "reqID", reqID, "chars", len(md))
-	ph.writeToolResult(w, map[string]any{
-		"excerpts": []string{md},
-	})
+	ph.writeToolResult(w, map[string]any{"excerpts": []string{md}})
 }
 
 func (ph *ProxyHandler) callExa(endpoint string, payload map[string]any) (map[string]any, error) {
@@ -424,16 +460,10 @@ func (ph *ProxyHandler) formatSearchResults(result map[string]any) []map[string]
 		title, _ := item["title"].(string)
 		url, _ := item["url"].(string)
 		text, _ := item["text"].(string)
-
 		if len(text) > 2000 {
 			text = text[:2000] + "..."
 		}
-
-		out = append(out, map[string]string{
-			"title": title,
-			"url":   url,
-			"text":  text,
-		})
+		out = append(out, map[string]string{"title": title, "url": url, "text": text})
 	}
 	return out
 }
@@ -471,34 +501,25 @@ func (ph *ProxyHandler) formatContentsResults(result map[string]any) string {
 func (ph *ProxyHandler) writeToolResult(w http.ResponseWriter, result any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]any{
-		"ok":     true,
-		"result": result,
-	})
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": result})
 }
 
 func (ph *ProxyHandler) writeToolError(w http.ResponseWriter, code string, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]any{
-		"ok":    false,
-		"error": map[string]string{"code": code, "message": message},
-	})
+	json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": map[string]string{"code": code, "message": message}})
 }
 
 // logRequest logs detailed request information
 func (ph *ProxyHandler) logRequest(reqID uint64, r *http.Request) {
 	slog.Info("request", "reqID", reqID, "method", r.Method, "path", r.URL.Path+formatQuery(r.URL.RawQuery))
 
-	// Log all headers
 	for name, values := range r.Header {
 		for _, v := range values {
-			// Truncate long values (e.g. auth tokens) but show enough to identify them
 			display := v
 			if len(display) > 120 {
 				display = display[:60] + "..." + display[len(display)-20:]
 			}
-			// Mask authorization tokens but show the scheme
 			lower := strings.ToLower(name)
 			if lower == "authorization" || lower == "cookie" {
 				if idx := strings.Index(display, " "); idx > 0 {
@@ -512,14 +533,10 @@ func (ph *ProxyHandler) logRequest(reqID uint64, r *http.Request) {
 		}
 	}
 
-	// Log content length / transfer encoding
 	if r.ContentLength > 0 {
 		slog.Debug("body", "reqID", reqID, "bytes", r.ContentLength, "contentType", r.Header.Get("Content-Type"))
-	} else if r.ContentLength == -1 && r.Body != nil {
-		slog.Debug("body", "reqID", reqID, "transfer", "chunked/unknown", "contentType", r.Header.Get("Content-Type"))
 	}
 
-	// Log body preview for JSON requests (useful for seeing model names, etc.)
 	if r.Body != nil && r.ContentLength > 0 && r.ContentLength <= 64*1024 &&
 		strings.Contains(r.Header.Get("Content-Type"), "json") {
 		body, err := io.ReadAll(r.Body)
@@ -529,71 +546,47 @@ func (ph *ProxyHandler) logRequest(reqID uint64, r *http.Request) {
 				preview = preview[:500] + fmt.Sprintf("... (%d bytes total)", len(body))
 			}
 			slog.Debug("json body", "reqID", reqID, "preview", preview)
-			// Replace the body so the proxy can still read it
 			r.Body = io.NopCloser(strings.NewReader(string(body)))
 		}
 	}
 }
 
-// findMatchedRule returns the name of the rule that matched, or "default"
-func (ph *ProxyHandler) findMatchedRule(r *http.Request) string {
-	rules := make([]Rule, len(ph.config.Rules))
-	copy(rules, ph.config.Rules)
-	sort.Slice(rules, func(i, j int) bool {
-		return rules[i].Priority > rules[j].Priority
-	})
-	for _, rule := range rules {
-		if rule.Match(r) {
-			return rule.Name
-		}
-	}
-	return "default"
-}
-
-// findTarget determines the target URL for a request
-func (ph *ProxyHandler) findTarget(r *http.Request) string {
-	rules := make([]Rule, len(ph.config.Rules))
-	copy(rules, ph.config.Rules)
-	sort.Slice(rules, func(i, j int) bool {
-		return rules[i].Priority > rules[j].Priority
-	})
-
-	for _, rule := range rules {
-		if rule.Match(r) {
-			return rule.Target
-		}
-	}
-
-	return ph.config.DefaultTarget
-}
-
-// Start starts the proxy server and blocks until ctx is cancelled, then shuts down gracefully.
+// Start starts the proxy server
 func (ph *ProxyHandler) Start(ctx context.Context) error {
+	// Start the embedded provider gateway
+	gw, err := NewProviderGateway(ph.config)
+	if err != nil {
+		return fmt.Errorf("create provider gateway: %w", err)
+	}
+	ph.gateway = gw
+
+	if err := gw.Start(ctx); err != nil {
+		return fmt.Errorf("start provider gateway: %w", err)
+	}
+
 	addr := net.JoinHostPort(ph.config.ListenAddr, fmt.Sprintf("%d", ph.config.ListenPort))
 
 	slog.Info("amp-proxy starting",
 		"listen", addr,
-		"vibeproxy", ph.config.VibeProxyTarget,
-		"ampcode", ph.config.DefaultTarget,
+		"ampcode", ph.config.AmpcodeURL,
+		"provider_gateway", gw.targetURL,
+		"auth_dir", ExpandHome(ph.config.AuthDir),
 		"exa", ph.config.ExaAPIKey != "",
 	)
 
-	slog.Info("routing rules (highest priority first)")
-	rules := make([]Rule, len(ph.config.Rules))
-	copy(rules, ph.config.Rules)
-	sort.Slice(rules, func(i, j int) bool {
-		return rules[i].Priority > rules[j].Priority
-	})
-	for _, rule := range rules {
-		dest := rule.Target
-		if dest == "" {
-			dest = "(blocked)"
-		}
-		dest = strings.Replace(dest, "https://", "", 1)
-		dest = strings.Replace(dest, "http://", "", 1)
-		slog.Info("rule", "priority", rule.Priority, "name", rule.Name, "target", dest)
+	slog.Info("routing rules")
+	slog.Info("rule", "priority", "100", "name", "provider", "match", "/api/provider/*, /v1/*, /api/v1/*", "target", "provider-gateway")
+	slog.Info("rule", "priority", "90", "name", "auth", "match", "/auth/*, /api/auth/*", "target", "302→ampcode.com")
+	slog.Info("rule", "priority", "80", "name", "tools", "match", "/api/internal?{web*,get*}", "target", "exa/stub")
+	slog.Info("rule", "priority", "-", "name", "default", "target", "ampcode.com")
+
+	// Print model remaps
+	for _, m := range ph.config.ModelRemaps {
+		slog.Info("model remap", "from", m.From, "to", m.Provider+"/"+m.To)
 	}
-	slog.Info("rule", "priority", "-", "name", "(default)", "target", strings.Replace(ph.config.DefaultTarget, "https://", "", 1))
+	if ph.config.Fallback != nil {
+		slog.Info("model remap", "from", "(fallback)", "to", ph.config.Fallback.Provider+"/"+ph.config.Fallback.To)
+	}
 
 	slog.Info("waiting for requests")
 
@@ -615,8 +608,17 @@ func (ph *ProxyHandler) Start(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 		slog.Info("shutting down...")
+
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// Shutdown provider gateway
+		if ph.gateway != nil {
+			if err := ph.gateway.Shutdown(shutdownCtx); err != nil {
+				slog.Error("provider gateway shutdown error", "error", err)
+			}
+		}
+
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shutdown: %w", err)
 		}

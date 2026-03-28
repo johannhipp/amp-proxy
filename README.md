@@ -1,14 +1,25 @@
 # amp-proxy
 
-## Why
+Use [Amp](https://ampcode.com) with your existing Claude Max, ChatGPT Plus, or Gemini subscriptions — no API billing.
 
-I love [Amp](https://ampcode.com) but just not that big of a fan of API billing, and there's this nice MacOS statusbar app called [vibeproxy](https://github.com/automazeio/vibeproxy) that exposes existing Claude Max, ChatGPT Plus, or Gemini subscriptions via an API. So I built [amp-proxy](https://github.com/johannhipp/amp-proxy) which sits in between.
+## Quick Start
 
-[Doesn't vibeproxy already do this?](https://github.com/automazeio/vibeproxy/blob/main/AMPCODE_SETUP.md). Yes, but only partially. It only works for LLM calls of the providers you've authenticated with in vibeproxy, but 
+```bash
+git clone https://github.com/johannhipp/amp-proxy && cd amp-proxy
+./bin/install.sh
+amp-proxy login claude
+amp-proxy
+```
 
-1) not for other providers and models that amp will request
-2) does not support server-side tools like `web_search` and `read_web_page`, where Amp has its own proprietary implementation
-3) does not support OAuth, which is required for auth, GitHub, threads, settings, etc. and a few other amp-native features. See all [changes needed to make this work](#features).
+Then point Amp at the proxy:
+
+```bash
+echo '{"amp.url": "http://localhost:18317"}' > ~/.config/amp/settings.json
+```
+
+## What It Does
+
+amp-proxy sits between the Amp CLI and the world. It routes LLM calls through your consumer subscriptions (via [CLIProxyAPIPlus](https://github.com/router-for-me/CLIProxyAPIPlus)) while keeping everything else — OAuth, threads, settings, GitHub — on ampcode.com.
 
 ```
 Amp CLI
@@ -16,65 +27,133 @@ Amp CLI
   ▼
 amp-proxy (:18317)
   │
-  ├── /api/provider/*  ──►  vibeproxy (:8317)   LLM calls
-  ├── /v1/*, /api/v1/* ──►  vibeproxy (:8317)   LLM streaming
-  ├── /auth/*          ──►  ampcode.com          OAuth (302 redirect)
-  └── everything else  ──►  ampcode.com          threads, settings, GitHub, etc.
+  ├── /api/provider/*  ──►  built-in provider gateway   LLM calls (Claude, GPT, Gemini, ...)
+  ├── /v1/*, /api/v1/* ──►  built-in provider gateway   LLM streaming
+  ├── /auth/*          ──►  ampcode.com                  OAuth (302 redirect)
+  ├── /api/internal    ──►  Exa API / stubs              web_search, read_web_page
+  └── everything else  ──►  ampcode.com                  threads, settings, GitHub
 ```
+
+Single binary. Single port. No vibeproxy needed.
 
 ## Features
 
-- **Request routing** -- LLM calls go to vibeproxy, while auth, threads, and settings stay on ampcode.com
-- **OAuth redirect** -- auth paths get 302'd to ampcode.com so cookies land on the right domain
-- **Model remapping** -- swap unsupported models (Gemini) for ones you have (Claude, GPT), with full request/response translation across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats, including streaming
-- **Stable subagent tool translation** -- fixes repeated same-name tool calls (like Finder's multiple `shell_command` steps) by tracking tool call/result IDs one-to-one, preventing duplicate `tool_result` protocol errors
-- **Web search via Exa** -- intercepts Amp's `web_search` and `read_web_page` server-side tools and routes them through the [Exa API](https://exa.ai) instead of ampcode.com's credit-gated backend
-- **Credit gate bypass** -- fakes `getUserFreeTierStatus` so the CLI doesn't block server-side tool dispatch
-- **Structured logging** -- every request logged with slog (request ID, headers redacted, JSON body previews, route decisions, response timing)
-- **Graceful shutdown** -- SIGINT/SIGTERM trigger a clean drain of in-flight requests (10s timeout)
-- **Health check** -- `/healthz` endpoint for Docker, k8s, or monitoring
-- **Request metrics** -- `/metrics` endpoint with JSON counters per route type
+- **Built-in provider auth** — `amp-proxy login claude` authenticates with your subscription, no separate app needed
+- **Multi-provider support** — Claude, OpenAI, Gemini, GitHub Copilot, Qwen — with round-robin and failover
+- **Model remapping** — unsupported models (Gemini) get translated to ones you have (Claude, GPT), with full request/response protocol translation across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats, including streaming
+- **Configurable** — model mappings, providers, API keys, routing strategy — all via optional YAML config
+- **Web search via Exa** — intercepts Amp's `web_search` and `read_web_page` tools and routes them through the [Exa API](https://exa.ai)
+- **Credit gate bypass** — fakes `getUserFreeTierStatus` so server-side tools aren't blocked
+- **Stable tool translation** — fixes repeated same-name tool calls with one-to-one ID tracking
+- **Zero config for common use** — works out of the box after `login`, config file only needed for advanced use
 
-## Setup
+## Install
 
-```bash
-# build
-make build
-
-# run (defaults: listen on :18317, vibeproxy on :8317)
-./bin/amp-proxy
-
-# with Exa web search enabled
-EXA_API_KEY=your-key ./bin/amp-proxy
-
-# with custom targets
-./bin/amp-proxy --port 18317 --vibeproxy http://localhost:8317 --ampcode https://ampcode.com
-```
-
-Point Amp at the proxy:
+Requires [Go 1.21+](https://go.dev/dl/). Works on macOS and Linux (amd64/arm64).
 
 ```bash
-echo '{"amp.url": "http://localhost:18317"}' > ~/.config/amp/settings.json
+git clone https://github.com/johannhipp/amp-proxy
+cd amp-proxy
+./bin/install.sh
 ```
 
-You'll also need the Amp API key registered for this URL. Copy your existing key:
+This builds amp-proxy and downloads `cli-proxy-api-plus` (needed for auth flows) into `~/.local/bin`.
+
+Override the install directory:
 
 ```bash
-# check your existing keys
-cat ~/.local/share/amp/secrets.json
-
-# add an entry for the proxy URL (same key, different URL)
+AMP_PROXY_INSTALL_DIR=/usr/local/bin ./bin/install.sh
 ```
 
-See `.env.example` for all configuration options.
+## Auth
 
-## Model remapping
+Authenticate with one or more providers:
 
-If you don't have a subscription for every provider Amp uses, amp-proxy can swap unsupported models for ones you do have access to. When Amp requests a Gemini model (and you don't have Google OAuth in vibeproxy), the proxy translates the request to a supported provider automatically.
+```bash
+amp-proxy login claude       # Claude Max / Pro
+amp-proxy login openai       # ChatGPT Plus / Pro
+amp-proxy login gemini       # Gemini
+amp-proxy login copilot      # GitHub Copilot
+amp-proxy login qwen         # Qwen
+```
 
-Default mappings in `remap.go`:
+Check status:
 
-| Amp requests | Gets served by | Provider |
+```bash
+amp-proxy status
+```
+
+```
+Provider     Status        Account              Expires
+────────     ──────        ───────              ───────
+claude       ✓ active      user@gmail.com       2025-04-15
+openai       ✓ active      user@gmail.com       2025-04-12
+gemini       ✗ not authed  -                    -
+```
+
+Tokens are stored in `~/.cli-proxy-api/` — compatible with vibeproxy, so existing tokens carry over.
+
+## Usage
+
+```bash
+# Start with defaults (127.0.0.1:18317)
+amp-proxy
+
+# Custom port
+amp-proxy serve --port 9000
+
+# With Exa web search
+EXA_API_KEY=your-key amp-proxy
+
+# Debug logging
+amp-proxy serve --debug
+```
+
+## Configuration
+
+Config is **optional**. amp-proxy works with zero config for most users. An optional YAML file unlocks advanced features.
+
+Auto-detected at `~/.config/amp-proxy/config.yaml` (macOS: `~/Library/Application Support/amp-proxy/config.yaml`), or set `AMP_PROXY_CONFIG`.
+
+```yaml
+# Only include what you want to change. Everything has defaults.
+
+# Exa API for web_search tool
+exa_api_key: ${EXA_API_KEY}
+
+# Provider routing: "round-robin" (default) or "fill-first"
+routing: fill-first
+
+# Custom model remapping
+model_remaps:
+  - from: gemini-3-flash-preview
+    to: claude-sonnet-4-6
+    provider: anthropic
+
+  - from: gemini-3-pro
+    to: gpt-5.4
+    provider: openai
+
+# Direct API keys (skip OAuth)
+anthropic_api_keys:
+  - key: ${ANTHROPIC_API_KEY}
+
+# Enable/disable providers
+providers:
+  claude: true
+  openai: true
+  gemini: false
+```
+
+See [`config.example.yaml`](config.example.yaml) for all options.
+
+## Model Remapping
+
+When Amp requests a model you don't have (e.g., Gemini), amp-proxy translates the request to a provider you do have. This includes full protocol translation — request body, response body, and streaming — across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats.
+
+Default mappings (configurable via YAML):
+
+| Amp requests | Served by | Provider |
 |---|---|---|
 | gemini-3-flash-preview | claude-sonnet-4-6 | Anthropic |
 | gemini-3-flash | claude-sonnet-4-6 | Anthropic |
@@ -82,40 +161,38 @@ Default mappings in `remap.go`:
 | gemini-3-pro-image | gpt-image-1 | OpenAI |
 | anything else unsupported | claude-sonnet-4-6 | Anthropic |
 
-The translation handles request/response format conversion between Google GenAI, Anthropic Messages, and OpenAI Chat Completions APIs. Streaming works too.
+## Web Search
 
-To change the mappings, edit the `modelMappings` slice in `remap.go`. Unmapped models fall back to Sonnet 4.6 with a warning in the logs so you know what to add.
+Amp's `web_search` and `read_web_page` are server-side tools on ampcode.com, gated by credits. amp-proxy intercepts them and routes through the [Exa API](https://exa.ai) instead.
 
-## Server-side tool interception
-
-Amp executes `web_search` and `read_web_page` server-side on ampcode.com, gated by a credit check. If your account has no credits, both tools fail. amp-proxy intercepts the `/api/internal` RPC calls and routes them to the Exa API instead.
-
-Three intercepts, in order:
-
-1. **`getUserFreeTierStatus` fake** -- The CLI polls this every 30s. ampcode.com returns `canUseAmpFree: false` when credits are exhausted, blocking tool dispatch. The proxy returns `canUseAmpFree: true` to unblock the client-side gate.
-
-2. **`webSearch2` → Exa `/search`** -- `web_search` tool calls become `POST /api/internal?webSearch2` with `{"method":"webSearch2","params":{"objective":"...","maxResults":N}}`. The proxy translates this to an Exa search request and returns results in the schema the CLI expects (`result.results[]` with `title`, `url`, `text`).
-
-3. **`extractWebPageContent` → Exa `/contents`** -- `read_web_page` calls become `POST /api/internal?extractWebPageContent` with `{"method":"extractWebPageContent","params":{"url":"...","objective":"..."}}`. The proxy fetches the page via Exa and returns content as `result.excerpts[]`.
-
-Set `EXA_API_KEY` to enable. Without it, both tools return a stub message instead of failing.
-
-## Logging
-
-Structured logs via `slog`. Every request includes request ID, method, path, route decision, and response timing.
-
-```
-INFO request reqID=14 method=POST path=/api/provider/anthropic/v1/messages
-INFO route   reqID=14 label=VIBEPROXY method=POST path=/api/provider/anthropic/v1/messages target=http://localhost:8317 rule=provider-to-vibeproxy
-INFO response reqID=14 label=VIBEPROXY status=200 statusText=OK bytes=8450 elapsed=15622ms
-```
+Set `EXA_API_KEY` to enable. Without it, tools return a stub message.
 
 ## Endpoints
 
 | Path | Method | Description |
 |------|--------|-------------|
-| `/healthz` | GET | Health check, returns `{"status":"ok"}` |
-| `/metrics` | GET | Request counters (total, vibeproxy, ampcode, remap, exa, errors) |
+| `/healthz` | GET | Health check → `{"status":"ok"}` |
+| `/metrics` | GET | Request counters (JSON) |
+
+## CLI Reference
+
+```
+amp-proxy [command] [flags]
+
+Commands:
+  serve     Start the proxy server (default)
+  login     Authenticate with a provider
+  logout    Remove saved auth for a provider
+  status    Show auth status for all providers
+  version   Print version info
+
+Flags (serve):
+  --port <port>      Listen port (default: 18317, env: LISTEN_PORT)
+  --addr <addr>      Listen address (default: 127.0.0.1, env: LISTEN_ADDR)
+  --config <path>    Config file path (env: AMP_PROXY_CONFIG)
+  --ampcode <url>    Ampcode URL (default: https://ampcode.com)
+  --debug            Enable debug logging (env: AMP_PROXY_DEBUG)
+```
 
 ## Development
 
@@ -126,26 +203,20 @@ make fmt     # format code
 make vet     # run go vet
 ```
 
+## Migrating from vibeproxy
+
+If you're already using vibeproxy + the old amp-proxy:
+
+1. Install the new amp-proxy: `./bin/install.sh`
+2. `amp-proxy status` — your existing tokens in `~/.cli-proxy-api/` are picked up automatically
+3. `amp-proxy` — start the proxy, vibeproxy is no longer needed
+4. Stop vibeproxy
+
 ## Releases
 
-Releases are fully automated via [`.github/workflows/release.yml`](.github/workflows/release.yml) and [`.goreleaser.yml`](.goreleaser.yml).
-
-- Push a tag like `v0.1.0` to build and publish a GitHub Release.
-- Run the workflow manually (`workflow_dispatch`) to validate a snapshot release without publishing artifacts.
-
-Tag-based release:
+Automated via [`.github/workflows/release.yml`](.github/workflows/release.yml) and [`.goreleaser.yml`](.goreleaser.yml).
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
-
-## Dependency Updates
-
-Renovate is configured in [`.github/renovate.json`](.github/renovate.json) for this repository.
-
-- Go module updates are grouped and run `go mod tidy` after updates.
-- GitHub Actions updates are grouped to reduce PR noise.
-- Major updates are labeled separately for easier review.
-
-To enable it, install the Renovate GitHub App for this repository.

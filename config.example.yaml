@@ -1,0 +1,76 @@
+# amp-proxy configuration
+# This file is OPTIONAL. amp-proxy works with zero config for most users.
+# Only include settings you want to change from defaults.
+
+# Server settings
+# port: 18317                # default: 18317
+# addr: 127.0.0.1            # default: 127.0.0.1 (localhost only)
+# ampcode_url: https://ampcode.com
+
+# Exa API for web_search and read_web_page tools (optional)
+# Get your key at https://dashboard.exa.ai/api-keys
+# exa_api_key: ${EXA_API_KEY}
+
+# Auth token directory (default: ~/.cli-proxy-api)
+# This is where OAuth tokens are stored. Compatible with vibeproxy.
+# auth_dir: ~/.cli-proxy-api
+
+# Provider routing strategy: "round-robin" (default) or "fill-first"
+# routing: round-robin
+
+# Provider request retry count
+# request_retry: 3
+
+# Request timeout in minutes (for long streaming responses)
+# request_timeout_mins: 10
+
+# Enable/disable providers (all enabled by default)
+# providers:
+#   claude: true
+#   openai: true
+#   gemini: false
+#   copilot: false
+
+# Model remapping (Google GenAI → supported providers)
+# When Amp requests a Gemini model, amp-proxy translates the request
+# to the target provider's wire format (full protocol translation).
+# model_remaps:
+#   - from: gemini-3-flash-preview
+#     to: claude-sonnet-4-6
+#     provider: anthropic
+#
+#   - from: gemini-3-flash
+#     to: claude-sonnet-4-6
+#     provider: anthropic
+#
+#   - from: gemini-3-pro
+#     to: gpt-5.4
+#     provider: openai
+#
+#   - from: gemini-3-pro-image
+#     to: gpt-image-1
+#     provider: openai
+
+# Fallback for unmapped models
+# fallback:
+#   to: claude-sonnet-4-6
+#   provider: anthropic
+
+# Direct API keys (skip OAuth, use your own API keys)
+# anthropic_api_keys:
+#   - key: ${ANTHROPIC_API_KEY}
+#     priority: 10
+#
+# openai_api_keys:
+#   - key: ${OPENAI_API_KEY}
+#     base_url: https://api.openai.com
+#
+# gemini_api_keys:
+#   - key: ${GEMINI_API_KEY}
+
+# OpenAI-compatible providers (e.g., OpenRouter, local models)
+# openai_compatible:
+#   - name: openrouter
+#     base_url: https://openrouter.ai/api/v1
+#     keys:
+#       - key: ${OPENROUTER_API_KEY}
