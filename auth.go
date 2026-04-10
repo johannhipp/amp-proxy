@@ -11,26 +11,32 @@ import (
 	"time"
 )
 
-// providerLoginFlags maps provider names to cli-proxy-api-plus login flags
-var providerLoginFlags = map[string]string{
-	"claude":       "-claude-login",
-	"openai":       "-codex-login",
-	"codex":        "-codex-login",
-	"gemini":       "-login",
-	"copilot":      "-github-copilot-login",
-	"qwen":         "-qwen-login",
-	"antigravity":  "-antigravity-login",
+type providerDef struct {
+	name      string
+	loginFlag string
+	tokenType string
 }
 
-// providerTokenTypes maps provider names to their token file type field
-var providerTokenTypes = map[string]string{
-	"claude":       "claude",
-	"openai":       "codex",
-	"codex":        "codex",
-	"gemini":       "gemini-cli",
-	"copilot":      "github-copilot",
-	"qwen":         "qwen",
-	"antigravity":  "antigravity",
+var providerDefs = []providerDef{
+	{"claude", "-claude-login", "claude"},
+	{"openai", "-codex-login", "codex"},
+	{"gemini", "-login", "gemini-cli"},
+	{"copilot", "-github-copilot-login", "github-copilot"},
+	{"qwen", "-qwen-login", "qwen"},
+	{"antigravity", "-antigravity-login", "antigravity"},
+}
+
+var providerLoginFlags = map[string]string{}
+var providerTokenTypes = map[string]string{}
+
+func init() {
+	for _, p := range providerDefs {
+		providerLoginFlags[p.name] = p.loginFlag
+		providerTokenTypes[p.name] = p.tokenType
+	}
+	// Aliases
+	providerLoginFlags["codex"] = providerLoginFlags["openai"]
+	providerTokenTypes["codex"] = providerTokenTypes["openai"]
 }
 
 // tokenFile represents a parsed auth token file
@@ -137,19 +143,7 @@ func RunStatus(authDir string) {
 	fmt.Fprintln(w, "Provider\tStatus\tAccount\tExpires")
 	fmt.Fprintln(w, "────────\t──────\t───────\t───────")
 
-	providers := []struct {
-		name      string
-		tokenType string
-	}{
-		{"claude", "claude"},
-		{"openai", "codex"},
-		{"gemini", "gemini-cli"},
-		{"copilot", "github-copilot"},
-		{"qwen", "qwen"},
-		{"antigravity", "antigravity"},
-	}
-
-	for _, p := range providers {
+	for _, p := range providerDefs {
 		tokens, ok := byType[p.tokenType]
 		if !ok || len(tokens) == 0 {
 			fmt.Fprintf(w, "%s\t✗ not authed\t-\t-\n", p.name)

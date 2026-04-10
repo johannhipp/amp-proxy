@@ -49,6 +49,13 @@ func isUnsupportedProviderRequest(r *http.Request) (provider string, ok bool) {
 func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Request, reqID uint64, model string, streaming bool, remap ModelRemapConfig, isExplicit bool) {
 	start := time.Now()
 
+	if ph.gateway == nil || !ph.gateway.IsReady() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":"provider_not_ready","message":"Provider gateway is starting up. Please retry."}`)
+		return
+	}
+
 	if !isExplicit {
 		slog.Warn("unmapped model, using fallback", "reqID", reqID, "model", model, "targetProvider", remap.Provider, "targetModel", remap.To)
 	}
@@ -134,9 +141,11 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	slog.Info("remap request", "reqID", reqID, "targetURL", targetURL, "model", remap.To, "stream", streaming)
 
 	// Make the request
-	resp, err := ph.httpClient.Do(outReq)
+	resp, err := ph.gateway.Do(outReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"upstream request failed: %s"}`, err.Error()), http.StatusBadGateway)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"error":"provider_unavailable","message":"Provider backend error: %s"}`, err.Error())
 		slog.Error("upstream request failed", "reqID", reqID, "error", err)
 		ph.metrics.errors.Add(1)
 		return

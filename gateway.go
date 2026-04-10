@@ -10,18 +10,19 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	"gopkg.in/yaml.v3"
 )
 
 // ProviderGateway manages the embedded CLIProxyAPIPlus service
 type ProviderGateway struct {
 	service    *cliproxy.Service
 	proxy      *httputil.ReverseProxy
+	client     *http.Client // for direct requests (remap path); no total timeout for streaming
 	targetURL  string
 	port       int
 	ready      bool
@@ -33,7 +34,11 @@ type ProviderGateway struct {
 func NewProviderGateway(appCfg *AppConfig) (*ProviderGateway, error) {
 	gw := &ProviderGateway{}
 
-	// Find a free port for the internal CLIProxyAPIPlus server
+	// Find a free port for the internal CLIProxyAPIPlus server.
+	// NOTE: There is a TOCTOU race between closing this listener and
+	// CLIProxyAPIPlus re-binding to the same port — another process could
+	// claim it in between. The CLIProxyAPIPlus SDK does not support
+	// accepting a pre-opened listener, so we accept this minor risk.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("find free port: %w", err)
@@ -70,14 +75,17 @@ func NewProviderGateway(appCfg *AppConfig) (*ProviderGateway, error) {
 	}
 	gw.service = svc
 
-	// Set up reverse proxy to the internal server
-	target, _ := url.Parse(gw.targetURL)
-	gw.proxy = httputil.NewSingleHostReverseProxy(target)
-	gw.proxy.Transport = &http.Transport{
+	// Set up shared transport for both the reverse proxy and direct client
+	transport := &http.Transport{
 		ResponseHeaderTimeout: 10 * time.Minute,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConnsPerHost:   20,
 	}
+
+	// Reverse proxy for normal provider requests
+	target, _ := url.Parse(gw.targetURL)
+	gw.proxy = httputil.NewSingleHostReverseProxy(target)
+	gw.proxy.Transport = transport
 	gw.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		slog.Error("provider gateway error", "path", r.URL.Path, "error", err)
 		w.Header().Set("Content-Type", "application/json")
@@ -85,12 +93,16 @@ func NewProviderGateway(appCfg *AppConfig) (*ProviderGateway, error) {
 		fmt.Fprintf(w, `{"error":"provider_unavailable","message":"Provider backend error: %s"}`, err.Error())
 	}
 
+	// Direct client for remap path — no total timeout so SSE streams aren't killed
+	gw.client = &http.Client{Transport: transport}
+
 	return gw, nil
 }
 
 // Start starts the embedded CLIProxyAPIPlus service in a background goroutine
 func (gw *ProviderGateway) Start(ctx context.Context) error {
 	errCh := make(chan error, 1)
+	readyCh := make(chan bool, 1)
 
 	go func() {
 		slog.Info("provider gateway starting", "port", gw.port)
@@ -100,20 +112,20 @@ func (gw *ProviderGateway) Start(ctx context.Context) error {
 		close(errCh)
 	}()
 
-	// Wait for the service to be ready
-	ready := gw.waitForReady(ctx, 15*time.Second)
+	go func() {
+		readyCh <- gw.waitForReady(ctx, 15*time.Second)
+	}()
 
-	// Check for early errors
 	select {
 	case err := <-errCh:
 		if err != nil {
 			return fmt.Errorf("provider gateway failed to start: %w", err)
 		}
-	default:
-	}
-
-	if !ready {
-		return fmt.Errorf("provider gateway did not become ready within timeout")
+		return fmt.Errorf("provider gateway exited unexpectedly")
+	case ready := <-readyCh:
+		if !ready {
+			return fmt.Errorf("provider gateway did not become ready within timeout")
+		}
 	}
 
 	gw.mu.Lock()
@@ -148,6 +160,19 @@ func (gw *ProviderGateway) waitForReady(ctx context.Context, timeout time.Durati
 	}
 }
 
+// Do sends a request through the gateway's shared transport (for remap path).
+// Unlike ph.httpClient, this has no total timeout so SSE streams work correctly.
+func (gw *ProviderGateway) Do(req *http.Request) (*http.Response, error) {
+	return gw.client.Do(req)
+}
+
+// IsReady returns whether the gateway is ready to accept requests
+func (gw *ProviderGateway) IsReady() bool {
+	gw.mu.RLock()
+	defer gw.mu.RUnlock()
+	return gw.ready
+}
+
 // ServeHTTP forwards the request to the embedded CLIProxyAPIPlus
 func (gw *ProviderGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	gw.mu.RLock()
@@ -167,12 +192,65 @@ func (gw *ProviderGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Shutdown gracefully stops the embedded service and cleans up
 func (gw *ProviderGateway) Shutdown(ctx context.Context) error {
 	if gw.configPath != "" {
-		os.Remove(gw.configPath)
+		if err := os.Remove(gw.configPath); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove temp cliproxy config", "path", gw.configPath, "error", err)
+		}
 	}
 	if gw.service != nil {
 		return gw.service.Shutdown(ctx)
 	}
 	return nil
+}
+
+type cliproxyConfig struct {
+	Port                   int                    `yaml:"port"`
+	Host                   string                 `yaml:"host"`
+	AuthDir                string                 `yaml:"auth-dir"`
+	Debug                  bool                   `yaml:"debug"`
+	UsageStatisticsEnabled bool                   `yaml:"usage-statistics-enabled"`
+	RequestRetry           int                    `yaml:"request-retry"`
+	RequestTimeout         string                 `yaml:"request-timeout,omitempty"`
+	MaxRetryCredentials    int                    `yaml:"max-retry-credentials,omitempty"`
+	Routing                *cliproxyRouting       `yaml:"routing,omitempty"`
+	RemoteManagement       cliproxyRemoteMgmt     `yaml:"remote-management"`
+	Ampcode                cliproxyAmpcode        `yaml:"ampcode"`
+	QuotaExceeded          cliproxyQuotaExceeded  `yaml:"quota-exceeded"`
+	ClaudeAPIKey           []cliproxyAPIKey       `yaml:"claude-api-key,omitempty"`
+	CodexAPIKey            []cliproxyAPIKey       `yaml:"codex-api-key,omitempty"`
+	GeminiAPIKey           []cliproxyAPIKey       `yaml:"gemini-api-key,omitempty"`
+	OpenAICompatibility    []cliproxyOpenAICompat `yaml:"openai-compatibility,omitempty"`
+	OAuthExcludedModels    map[string][]string    `yaml:"oauth-excluded-models,omitempty"`
+}
+
+type cliproxyRouting struct {
+	Strategy string `yaml:"strategy"`
+}
+
+type cliproxyRemoteMgmt struct {
+	AllowRemote         bool `yaml:"allow-remote"`
+	DisableControlPanel bool `yaml:"disable-control-panel"`
+}
+
+type cliproxyAmpcode struct {
+	UpstreamURL                   string `yaml:"upstream-url"`
+	RestrictManagementToLocalhost bool   `yaml:"restrict-management-to-localhost"`
+}
+
+type cliproxyQuotaExceeded struct {
+	SwitchProject      bool `yaml:"switch-project"`
+	SwitchPreviewModel bool `yaml:"switch-preview-model"`
+}
+
+type cliproxyAPIKey struct {
+	APIKey   string `yaml:"api-key"`
+	BaseURL  string `yaml:"base-url,omitempty"`
+	Priority int    `yaml:"priority,omitempty"`
+}
+
+type cliproxyOpenAICompat struct {
+	Name          string           `yaml:"name"`
+	BaseURL       string           `yaml:"base-url"`
+	APIKeyEntries []cliproxyAPIKey `yaml:"api-key-entries,omitempty"`
 }
 
 // writeConfig generates a CLIProxyAPIPlus YAML config file from AppConfig
@@ -182,99 +260,73 @@ func (gw *ProviderGateway) writeConfig(appCfg *AppConfig) (string, error) {
 		return "", fmt.Errorf("create auth dir: %w", err)
 	}
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "port: %d\n", gw.port)
-	fmt.Fprintf(&b, "host: 127.0.0.1\n")
-	fmt.Fprintf(&b, "auth-dir: %q\n", authDir)
-	fmt.Fprintf(&b, "debug: false\n")
-	fmt.Fprintf(&b, "usage-statistics-enabled: false\n")
-	fmt.Fprintf(&b, "request-retry: %d\n", appCfg.RequestRetry)
+	cfg := cliproxyConfig{
+		Port:         gw.port,
+		Host:         "127.0.0.1",
+		AuthDir:      authDir,
+		RequestRetry: appCfg.RequestRetry,
+		RemoteManagement: cliproxyRemoteMgmt{
+			DisableControlPanel: true,
+		},
+		Ampcode: cliproxyAmpcode{
+			UpstreamURL:                   appCfg.AmpcodeURL,
+			RestrictManagementToLocalhost: true,
+		},
+		QuotaExceeded: cliproxyQuotaExceeded{
+			SwitchProject:      true,
+			SwitchPreviewModel: true,
+		},
+	}
+
 	if appCfg.RequestTimeoutMins > 0 {
-		fmt.Fprintf(&b, "request-timeout: %q\n", fmt.Sprintf("%dm", appCfg.RequestTimeoutMins))
+		cfg.RequestTimeout = fmt.Sprintf("%dm", appCfg.RequestTimeoutMins)
 	}
 	if appCfg.MaxRetryCredentials > 0 {
-		fmt.Fprintf(&b, "max-retry-credentials: %d\n", appCfg.MaxRetryCredentials)
+		cfg.MaxRetryCredentials = appCfg.MaxRetryCredentials
 	}
-
-	// Routing strategy
 	if appCfg.Routing != "" {
-		fmt.Fprintf(&b, "routing:\n  strategy: %q\n", appCfg.Routing)
+		cfg.Routing = &cliproxyRouting{Strategy: appCfg.Routing}
 	}
 
-	// Disable management panel (not needed for local use)
-	fmt.Fprintf(&b, "remote-management:\n  allow-remote: false\n  disable-control-panel: true\n")
+	for _, k := range appCfg.AnthropicAPIKeys {
+		cfg.ClaudeAPIKey = append(cfg.ClaudeAPIKey, cliproxyAPIKey{
+			APIKey: k.Key, Priority: k.Priority,
+		})
+	}
+	for _, k := range appCfg.OpenAIAPIKeys {
+		cfg.CodexAPIKey = append(cfg.CodexAPIKey, cliproxyAPIKey{
+			APIKey: k.Key, BaseURL: k.BaseURL, Priority: k.Priority,
+		})
+	}
+	for _, k := range appCfg.GeminiAPIKeys {
+		cfg.GeminiAPIKey = append(cfg.GeminiAPIKey, cliproxyAPIKey{
+			APIKey: k.Key, Priority: k.Priority,
+		})
+	}
 
-	// Amp upstream config — leave empty so CLIProxyAPIPlus doesn't try Amp routing
-	// We handle Amp routing ourselves
-	fmt.Fprintf(&b, "ampcode:\n  upstream-url: \"\"\n  restrict-management-to-localhost: true\n")
-
-	// Quota exceeded behavior
-	fmt.Fprintf(&b, "quota-exceeded:\n  switch-project: true\n  switch-preview-model: true\n")
-
-	// Direct API keys
-	if len(appCfg.AnthropicAPIKeys) > 0 {
-		fmt.Fprintf(&b, "claude-api-key:\n")
-		for _, k := range appCfg.AnthropicAPIKeys {
-			fmt.Fprintf(&b, "  - api-key: %q\n", k.Key)
-			if k.Priority > 0 {
-				fmt.Fprintf(&b, "    priority: %d\n", k.Priority)
-			}
+	for _, compat := range appCfg.OpenAICompatible {
+		c := cliproxyOpenAICompat{Name: compat.Name, BaseURL: compat.BaseURL}
+		for _, k := range compat.Keys {
+			c.APIKeyEntries = append(c.APIKeyEntries, cliproxyAPIKey{APIKey: k.Key})
 		}
+		cfg.OpenAICompatibility = append(cfg.OpenAICompatibility, c)
 	}
 
-	if len(appCfg.OpenAIAPIKeys) > 0 {
-		fmt.Fprintf(&b, "codex-api-key:\n")
-		for _, k := range appCfg.OpenAIAPIKeys {
-			fmt.Fprintf(&b, "  - api-key: %q\n", k.Key)
-			if k.BaseURL != "" {
-				fmt.Fprintf(&b, "    base-url: %q\n", k.BaseURL)
-			}
-			if k.Priority > 0 {
-				fmt.Fprintf(&b, "    priority: %d\n", k.Priority)
-			}
-		}
-	}
-
-	if len(appCfg.GeminiAPIKeys) > 0 {
-		fmt.Fprintf(&b, "gemini-api-key:\n")
-		for _, k := range appCfg.GeminiAPIKeys {
-			fmt.Fprintf(&b, "  - api-key: %q\n", k.Key)
-			if k.Priority > 0 {
-				fmt.Fprintf(&b, "    priority: %d\n", k.Priority)
-			}
-		}
-	}
-
-	// OpenAI-compatible providers
-	if len(appCfg.OpenAICompatible) > 0 {
-		fmt.Fprintf(&b, "openai-compatibility:\n")
-		for _, compat := range appCfg.OpenAICompatible {
-			fmt.Fprintf(&b, "  - name: %q\n", compat.Name)
-			fmt.Fprintf(&b, "    base-url: %q\n", compat.BaseURL)
-			if len(compat.Keys) > 0 {
-				fmt.Fprintf(&b, "    api-key:\n")
-				for _, k := range compat.Keys {
-					fmt.Fprintf(&b, "      - api-key: %q\n", k.Key)
-				}
-			}
-		}
-	}
-
-	// Provider exclusions (disabled providers)
-	var excluded []string
+	excluded := make(map[string][]string)
 	for provider, enabled := range appCfg.Providers {
 		if !enabled {
-			tokenType, ok := providerTokenTypes[provider]
-			if ok {
-				excluded = append(excluded, tokenType)
+			if tokenType, ok := providerTokenTypes[provider]; ok {
+				excluded[tokenType] = []string{"*"}
 			}
 		}
 	}
 	if len(excluded) > 0 {
-		fmt.Fprintf(&b, "oauth-excluded-models:\n")
-		for _, prov := range excluded {
-			fmt.Fprintf(&b, "  %s:\n    - \"*\"\n", prov)
-		}
+		cfg.OAuthExcludedModels = excluded
+	}
+
+	data, err := yaml.Marshal(&cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshal cliproxy config: %w", err)
 	}
 
 	// Write to config dir (survives /tmp cleanup, cleaned up on shutdown)
@@ -288,7 +340,7 @@ func (gw *ProviderGateway) writeConfig(appCfg *AppConfig) (string, error) {
 		return "", fmt.Errorf("create config dir: %w", err)
 	}
 	configPath := filepath.Join(configDir, "cliproxy-internal.yaml")
-	if err := os.WriteFile(configPath, []byte(b.String()), 0600); err != nil {
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		return "", err
 	}
 

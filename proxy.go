@@ -170,6 +170,12 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Provider requests → embedded CLIProxyAPIPlus
 	if isProviderRequest(r) {
+		if ph.gateway == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":"provider_not_ready","message":"Provider gateway is starting up. Please retry."}`)
+			return
+		}
 		ph.metrics.providerReqs.Add(1)
 
 		// Strip unsupported OpenAI fields before forwarding
@@ -228,7 +234,7 @@ func hasPathPrefix(path, prefix string) bool {
 // stripCacheControl removes cache_control keys from request JSON bodies
 // This prevents 400 errors when requests go through the OAuth route
 func stripCacheControl(r *http.Request) {
-	if r.Body == nil || r.ContentLength == 0 {
+	if r.Body == nil {
 		return
 	}
 	ct := r.Header.Get("Content-Type")

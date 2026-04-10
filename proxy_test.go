@@ -7,12 +7,6 @@ import (
 	"testing"
 )
 
-func newTestConfig(providerURL, ampcodeURL string) *AppConfig {
-	cfg := DefaultConfig()
-	cfg.AmpcodeURL = ampcodeURL
-	return cfg
-}
-
 func TestAuthRequestsRedirectToAmpcode(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.AmpcodeURL = "https://ampcode.com"

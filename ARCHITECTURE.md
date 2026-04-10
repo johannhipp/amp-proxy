@@ -10,7 +10,7 @@ The original YAML schema was ~60 lines with sections for thinking, gateway, clip
 ### Flaw 2: Embedding CLIProxyAPIPlus via Builder/Service drags in gin
 The `cliproxy.Builder` and `cliproxy.Service` types import `internal/api` which imports gin — even if you never call `Run()`. But `coreauth.Manager` and the executor layer have **zero gin dependency** and can be used standalone.
 
-**Fix:** Use `coreauth.NewManager()` directly, not `Builder`/`Service`. No gin in our binary. We construct the auth manager, register executors, and use `Execute()`/`HttpRequest()` directly.
+**Fix:** Embed CLIProxyAPIPlus via `cliproxy.Builder`/`Service` on a localhost ephemeral port. While this pulls in gin as a transitive dependency, it reuses the full battle-tested auth pipeline (token refresh, retry, credential selection) without reimplementing it. The gin dependency is acceptable since it only adds ~10MB and is never exposed externally.
 
 ### Flaw 3: Default bind address `0.0.0.0` is too open
 A local dev tool with auth tokens should not default to all interfaces.
@@ -49,7 +49,7 @@ Config hot-reload via fsnotify adds complexity. Restarting a local tool takes <1
 ### Design Principles
 
 1. **Zero config for common use** — clone, build, `amp-proxy login claude`, `amp-proxy serve`, done
-2. **Zero gin** — use `coreauth.Manager` directly, not `Builder`/`Service`
+2. **Embedded auth server** — `cliproxy.Builder`/`Service` on localhost ephemeral port; gin is a transitive dep but never exposed externally
 3. **Fail gracefully** — provider down? auth expired? Non-provider routes keep working, provider routes return actionable errors
 4. **Reuse existing tokens** — `~/.cli-proxy-api/` works as-is for users coming from vibeproxy
 5. **One binary, one port, one process**
@@ -67,46 +67,44 @@ Amp CLI → amp-proxy (:18317) → vibeproxy (:8317) → CLIProxyAPIPlus (:8318)
 Amp CLI → amp-proxy (:18317)
               ├─ /auth/*              → 302 redirect to ampcode.com
               ├─ /api/internal        → tool stubs / Exa
-              ├─ /api/provider/*      → provider pipeline → coreauth.Manager → providers
-              ├─ /v1/*, /api/v1/*     → provider pipeline → coreauth.Manager → providers
+              ├─ /api/provider/*      → provider pipeline → embedded CLIProxyAPIPlus (127.0.0.1:ephemeral) → providers
+              ├─ /v1/*, /api/v1/*     → provider pipeline → embedded CLIProxyAPIPlus (127.0.0.1:ephemeral) → providers
               └─ everything else      → ampcode.com reverse proxy
 ```
 
-**No embedded HTTP server. No gin.** The `coreauth.Manager` is used as a pure Go library — we call `Execute()` / `HttpRequest()` directly.
+**Embedded CLIProxyAPIPlus on localhost.** A `cliproxy.Service` runs on an ephemeral `127.0.0.1` port inside the process. Provider requests are reverse-proxied to it, reusing the full auth pipeline.
 
 ---
 
-## How CLIProxyAPIPlus Is Used (Without Gin)
+## How CLIProxyAPIPlus Is Embedded
 
-Based on the SDK's `examples/http-request` pattern:
+Using `cliproxy.Builder`/`Service` to run the full auth server in-process:
 
 ```go
 import (
-    coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+    "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
+    "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
-// Construct standalone — no Builder, no Service, no gin
-core := coreauth.NewManager(tokenStore, &coreauth.RoundRobinSelector{}, nil)
+// Load config, override host/port to localhost ephemeral
+cfg, _ := config.LoadConfig(configPath)
+cfg.Host = "127.0.0.1"
+cfg.Port = ephemeralPort
 
-// Register built-in executors for each provider
-core.RegisterExecutor(claudeExecutor)
-core.RegisterExecutor(openaiExecutor)
+// Build the service
+service, _ := cliproxy.NewBuilder().
+    WithConfig(cfg).
+    WithConfigPath(configPath).
+    Build()
 
-// Load credentials from ~/.cli-proxy-api/
-core.Load(ctx)
+// Run in background goroutine
+go service.Run(ctx)
 
-// Start background token refresh
-core.StartAutoRefresh(ctx, 5*time.Minute)
-
-// For each provider request:
-// Option A: full Execute() with selector + retry
-resp, err := core.Execute(ctx, []string{"claude"}, request, opts)
-
-// Option B: inject credentials into an existing http.Request
-core.InjectCredentials(req, authID)
+// Provider requests are reverse-proxied to this address
+proxyURL := fmt.Sprintf("http://127.0.0.1:%d", ephemeralPort)
 ```
 
-### What we get for free from coreauth.Manager
+### What we get for free from the embedded CLIProxyAPIPlus
 - OAuth token refresh (background loop)
 - Round-robin / fill-first credential selection
 - Multi-account failover with cooldown
@@ -249,7 +247,7 @@ incoming request
     │       ├─ strip cache_control from body (prevents 400 via OAuth)
     │       └─ strip unsupported OpenAI fields (stream_options)
     │
-    ├─ [4] credential injection via coreauth.Manager
+    ├─ [4] reverse-proxy to embedded CLIProxyAPIPlus
     │       ├─ selects credential (round-robin/fill-first)
     │       ├─ injects auth headers
     │       └─ sends to upstream provider
@@ -269,18 +267,15 @@ incoming request
 
 ```
 amp-proxy/
-├── main.go                          # CLI entry, subcommands
-├── cmd/
-│   ├── serve.go                     # start proxy server
-│   ├── login.go                     # amp-proxy login <provider>
-│   └── status.go                    # amp-proxy status
+├── main.go                          # CLI entry, subcommands (serve/login/logout/status)
 ├── config.go                        # YAML loader (optional file), env expansion, defaults
-├── proxy.go                         # HTTP handler, routing (evolved from current)
-├── provider.go                      # provider request pipeline + coreauth.Manager integration
-├── remap.go                         # model mapping (from config), Google protocol translation
-├── translate_anthropic.go           # Google ↔ Anthropic (kept as-is)
-├── translate_openai.go              # Google ↔ OpenAI (kept as-is)
-├── tool_call_tracker.go             # (kept as-is)
+├── proxy.go                         # HTTP handler, routing
+├── gateway.go                       # embedded CLIProxyAPIPlus (Builder/Service/writeConfig)
+├── auth.go                          # login/logout/status CLI, token scanning
+├── remap.go                         # model mapping, Google protocol translation
+├── translate_anthropic.go           # Google ↔ Anthropic
+├── translate_openai.go              # Google ↔ OpenAI
+├── tool_call_tracker.go             # tool result ID deduplication
 ├── config.example.yaml
 ├── go.mod
 └── go.sum
@@ -293,7 +288,7 @@ amp-proxy/
 ## What's In vs. Out of Scope
 
 ### In scope (v1)
-- Embed `coreauth.Manager` (no gin) for credential management
+- Embed CLIProxyAPIPlus via `cliproxy.Builder`/`Service` for credential management
 - `login` / `logout` / `status` CLI subcommands
 - Optional YAML config for model remaps, API keys, provider toggles
 - `cache_control` stripping (needed to prevent 400s via OAuth route)
@@ -306,7 +301,7 @@ amp-proxy/
 - ~~Vercel gateway bypass~~ — vibeproxy-specific
 - ~~Config hot-reload~~ — restart is fast enough
 - ~~Management dashboard~~ — not needed for local tool
-- ~~gin HTTP server~~ — use coreauth.Manager directly
+- ~~Standalone gin HTTP server~~ — gin is present as a transitive dep of CLIProxyAPIPlus but only listens on localhost
 
 ### Future (if proven needed)
 - Thinking param injection (only if Amp CLI actually sends `-thinking-N`)
@@ -339,8 +334,8 @@ amp-proxy/
 
 | Risk | Mitigation |
 |------|-----------|
-| coreauth.Manager executors pull in gin transitively | Check import chains before using built-in executors. May need thin wrappers. |
-| Token refresh races during serving | coreauth.Manager handles this internally with singleflight |
+| gin pulled in as transitive dep via `cliproxy.Builder` | Acceptable: adds ~10MB, only listens on 127.0.0.1 ephemeral port, never exposed externally. |
+| Token refresh races during serving | CLIProxyAPIPlus handles this internally with singleflight |
 | Provider down takes out whole proxy | Non-provider routes always work. Provider errors return 503 with clear message. |
 | CLIProxyAPIPlus API changes (v6→v7) | Pin to specific version. Adapter layer is thin enough to update. |
 | Binary size increase | Acceptable tradeoff for auth management. Measure before/after. |

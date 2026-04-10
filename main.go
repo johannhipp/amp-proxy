@@ -15,13 +15,6 @@ import (
 var version = "dev"
 
 func main() {
-	// Global flags
-	var (
-		configPath string
-		debug      bool
-	)
-
-	// Determine subcommand
 	args := os.Args[1:]
 	cmd := "serve"
 	if len(args) > 0 && args[0] != "" && args[0][0] != '-' {
@@ -31,7 +24,7 @@ func main() {
 
 	switch cmd {
 	case "serve":
-		cmdServe(args, configPath, debug)
+		cmdServe(args)
 	case "login":
 		cmdLogin(args)
 	case "logout":
@@ -49,7 +42,17 @@ func main() {
 	}
 }
 
-func cmdServe(args []string, _ string, _ bool) {
+func loadConfigFromArgs(name string, args []string) (*AppConfig, error) {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	configPath := fs.String("config", "", "Config file path")
+	fs.Parse(args)
+	if v := os.Getenv("AMP_PROXY_CONFIG"); v != "" && *configPath == "" {
+		*configPath = v
+	}
+	return LoadConfig(*configPath)
+}
+
+func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := fs.Int("port", 18317, "Port to listen on")
 	addr := fs.String("addr", "127.0.0.1", "Address to listen on")
@@ -123,15 +126,7 @@ func cmdLogin(args []string) {
 	}
 	provider := args[0]
 
-	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	configPath := fs.String("config", "", "Config file path")
-	fs.Parse(args[1:])
-
-	if v := os.Getenv("AMP_PROXY_CONFIG"); v != "" && *configPath == "" {
-		*configPath = v
-	}
-
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := loadConfigFromArgs("login", args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
@@ -150,15 +145,7 @@ func cmdLogout(args []string) {
 	}
 	provider := args[0]
 
-	fs := flag.NewFlagSet("logout", flag.ExitOnError)
-	configPath := fs.String("config", "", "Config file path")
-	fs.Parse(args[1:])
-
-	if v := os.Getenv("AMP_PROXY_CONFIG"); v != "" && *configPath == "" {
-		*configPath = v
-	}
-
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := loadConfigFromArgs("logout", args[1:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
@@ -171,15 +158,7 @@ func cmdLogout(args []string) {
 }
 
 func cmdStatus(args []string) {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	configPath := fs.String("config", "", "Config file path")
-	fs.Parse(args)
-
-	if v := os.Getenv("AMP_PROXY_CONFIG"); v != "" && *configPath == "" {
-		*configPath = v
-	}
-
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := loadConfigFromArgs("status", args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)

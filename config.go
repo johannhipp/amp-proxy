@@ -138,9 +138,7 @@ func LoadConfig(path string) (*AppConfig, error) {
 func findConfigFile() string {
 	// Check env var
 	if v := os.Getenv("AMP_PROXY_CONFIG"); v != "" {
-		if _, err := os.Stat(v); err == nil {
-			return v
-		}
+		return v
 	}
 
 	// Check os.UserConfigDir()/amp-proxy/config.yaml
@@ -211,5 +209,5 @@ func (cfg *AppConfig) FindModelRemap(model string) (ModelRemapConfig, bool) {
 	if cfg.Fallback != nil {
 		return *cfg.Fallback, false
 	}
-	return ModelRemapConfig{To: "claude-sonnet-4-6", Provider: "anthropic"}, false
+	return ModelRemapConfig{}, false
 }
