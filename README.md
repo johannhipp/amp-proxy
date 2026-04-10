@@ -147,6 +147,18 @@ providers:
 
 See [`config.example.yaml`](config.example.yaml) for all options.
 
+## Prompt Caching
+
+By default, amp-proxy strips `cache_control` fields from request bodies before forwarding to providers. This prevents 400 errors on some OAuth routes, but **disables Anthropic prompt caching** — which can significantly increase token usage in long sessions.
+
+To enable prompt caching, set `strip_cache_control: false` in your config:
+
+```yaml
+strip_cache_control: false
+```
+
+If you see 400 errors from Anthropic after disabling this, re-enable it.
+
 ## Model Remapping
 
 When Amp requests a model you don't have (e.g., Gemini), amp-proxy translates the request to a provider you do have. This includes full protocol translation — request body, response body, and streaming — across Google GenAI, Anthropic Messages, and OpenAI Chat Completions formats.

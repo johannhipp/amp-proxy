@@ -185,9 +185,12 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Strip cache_control from request bodies (prevents 400 via OAuth route)
-		if r.Method == "POST" && r.Body != nil {
-			stripCacheControl(r)
+		// Strip cache_control from request bodies (prevents 400 via OAuth route,
+		// but disables Anthropic prompt caching — set strip_cache_control: false to preserve)
+		if ph.config.StripCacheControl == nil || *ph.config.StripCacheControl {
+			if r.Method == "POST" && r.Body != nil {
+				stripCacheControl(r)
+			}
 		}
 
 		slog.Info("route", "reqID", reqID, "label", "PROVIDER", "method", r.Method, "path", r.URL.Path)

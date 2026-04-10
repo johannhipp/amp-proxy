@@ -47,6 +47,11 @@ type AppConfig struct {
 
 	// OpenAI-compatible providers
 	OpenAICompatible []OpenAICompatConfig `yaml:"openai_compatible"`
+
+	// Strip cache_control fields from request bodies before forwarding.
+	// Prevents 400 errors on some OAuth routes, but disables Anthropic prompt caching.
+	// Set to false to preserve cache_control and enable prompt caching.
+	StripCacheControl *bool `yaml:"strip_cache_control"`
 }
 
 // ModelRemapConfig defines how to remap an unsupported model
@@ -96,6 +101,7 @@ func DefaultConfig() *AppConfig {
 		},
 		RequestRetry:       3,
 		RequestTimeoutMins: 10,
+		StripCacheControl:  boolPtr(true),
 	}
 }
 
@@ -163,6 +169,8 @@ func applyEnvOverrides(cfg *AppConfig) {
 		cfg.ExaAPIKey = v
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 var envVarRegex = regexp.MustCompile(`\$\{([^}]+)\}`)
 
