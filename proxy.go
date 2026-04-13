@@ -195,7 +195,11 @@ func (ph *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		slog.Info("route", "reqID", reqID, "label", "PROVIDER", "method", r.Method, "path", r.URL.Path)
 
-		rec := &responseRecorder{ResponseWriter: w, statusCode: 200}
+		// Wrap response writer to fix tool name casing in LLM responses.
+		// Amp's agent modes check tool names case-sensitively (e.g. "Bash" not "bash"),
+		// but some models return lowercase names.
+		rewriter := newToolNameRewriter(w)
+		rec := &responseRecorder{ResponseWriter: rewriter, statusCode: 200}
 		ph.gateway.ServeHTTP(rec, r)
 
 		elapsed := time.Since(start)
