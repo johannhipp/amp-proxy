@@ -13,31 +13,6 @@ import (
 	"time"
 )
 
-// ModelMapping defines how to remap an unsupported model to a supported one
-type ModelMapping struct {
-	SourcePattern  string // glob-style match on source model name
-	TargetModel    string // target model identifier
-	TargetProvider string // "anthropic" or "openai"
-	TargetPath     string // API path to use on vibeproxy
-}
-
-var modelMappings = []ModelMapping{
-	// Gemini flash variants -> Claude Sonnet 4.6 (latest)
-	{SourcePattern: "gemini-3-flash-preview", TargetModel: "claude-sonnet-4-6", TargetProvider: "anthropic", TargetPath: "/api/provider/anthropic/v1/messages"},
-	{SourcePattern: "gemini-3-flash", TargetModel: "claude-sonnet-4-6", TargetProvider: "anthropic", TargetPath: "/api/provider/anthropic/v1/messages"},
-	// Gemini pro -> GPT 5.4
-	{SourcePattern: "gemini-3-pro", TargetModel: "gpt-5.4", TargetProvider: "openai", TargetPath: "/api/provider/openai/v1/chat/completions"},
-	// Gemini pro image -> GPT image
-	{SourcePattern: "gemini-3-pro-image", TargetModel: "gpt-image-1", TargetProvider: "openai", TargetPath: "/api/provider/openai/v1/chat/completions"},
-}
-
-// Fallback for any model we don't explicitly map
-var fallbackMapping = ModelMapping{
-	TargetModel:    "claude-sonnet-4-6",
-	TargetProvider: "anthropic",
-	TargetPath:     "/api/provider/anthropic/v1/messages",
-}
-
 // googleModelRegex extracts the model name from Google provider paths
 var googleModelRegex = regexp.MustCompile(`/api/provider/google/.+/models/([^/:]+):(generateContent|streamGenerateContent)`)
 
@@ -58,7 +33,6 @@ func isUnsupportedProviderRequest(r *http.Request) (provider string, ok bool) {
 	if !strings.HasPrefix(r.URL.Path, "/api/provider/") {
 		return "", false
 	}
-	// Extract provider name from /api/provider/{provider}/...
 	rest := strings.TrimPrefix(r.URL.Path, "/api/provider/")
 	parts := strings.SplitN(rest, "/", 2)
 	if len(parts) == 0 {
@@ -71,22 +45,19 @@ func isUnsupportedProviderRequest(r *http.Request) (provider string, ok bool) {
 	return provider, true
 }
 
-// findMapping returns the mapping for a given model, or the fallback
-func findMapping(model string) (ModelMapping, bool) {
-	for _, m := range modelMappings {
-		if m.SourcePattern == model {
-			return m, true
-		}
-	}
-	return fallbackMapping, false
-}
-
 // handleRemappedRequest handles a request that needs model remapping
-func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Request, reqID uint64, model string, streaming bool, mapping ModelMapping, isExplicit bool) {
+func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Request, reqID uint64, model string, streaming bool, remap ModelRemapConfig, isExplicit bool) {
 	start := time.Now()
 
+	if ph.gateway == nil || !ph.gateway.IsReady() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":"provider_not_ready","message":"Provider gateway is starting up. Please retry."}`)
+		return
+	}
+
 	if !isExplicit {
-		slog.Warn("unmapped model, using fallback", "reqID", reqID, "model", model, "targetProvider", mapping.TargetProvider, "targetModel", mapping.TargetModel)
+		slog.Warn("unmapped model, using fallback", "reqID", reqID, "model", model, "targetProvider", remap.Provider, "targetModel", remap.To)
 	}
 
 	// Read the original request body
@@ -109,11 +80,11 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 
 	// Translate based on target provider
 	var translatedBody []byte
-	switch mapping.TargetProvider {
+	switch remap.Provider {
 	case "anthropic":
-		translatedBody, err = translateGoogleToAnthropic(googleReq, mapping.TargetModel, streaming)
+		translatedBody, err = translateGoogleToAnthropic(googleReq, remap.To, streaming)
 	case "openai":
-		translatedBody, err = translateGoogleToOpenAI(googleReq, mapping.TargetModel, streaming)
+		translatedBody, err = translateGoogleToOpenAI(googleReq, remap.To, streaming)
 	default:
 		http.Error(w, `{"error":"unsupported target provider"}`, http.StatusInternalServerError)
 		return
@@ -124,15 +95,16 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 		ph.metrics.errors.Add(1)
 		return
 	}
-	if err := validateTranslatedToolResults(mapping.TargetProvider, translatedBody); err != nil {
+	if err := validateTranslatedToolResults(remap.Provider, translatedBody); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"translated request validation failed: %s"}`, err.Error()), http.StatusInternalServerError)
-		slog.Error("translated request validation failed", "reqID", reqID, "provider", mapping.TargetProvider, "error", err)
+		slog.Error("translated request validation failed", "reqID", reqID, "provider", remap.Provider, "error", err)
 		ph.metrics.errors.Add(1)
 		return
 	}
 
-	// Build the outbound request to vibeproxy
-	targetURL := ph.config.VibeProxyTarget + mapping.TargetPath
+	// Build the outbound request — route through the embedded provider gateway
+	targetPath := TargetPathForProvider(remap.Provider)
+	targetURL := ph.gateway.targetURL + targetPath
 	outReq, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(translatedBody))
 	if err != nil {
 		http.Error(w, `{"error":"failed to create request"}`, http.StatusInternalServerError)
@@ -147,7 +119,6 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	for _, cookie := range r.Cookies() {
 		outReq.AddCookie(cookie)
 	}
-	// Forward Amp-specific headers
 	for name, values := range r.Header {
 		if strings.HasPrefix(name, "X-Amp-") {
 			for _, v := range values {
@@ -157,23 +128,24 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	}
 
 	// Set Anthropic-specific headers
-	if mapping.TargetProvider == "anthropic" {
+	if remap.Provider == "anthropic" {
 		outReq.Header.Set("Anthropic-Version", "2023-06-01")
 	}
 
-	// Log the translated body for debugging
 	if len(translatedBody) <= 2000 {
 		slog.Debug("remap translated body", "reqID", reqID, "body", string(translatedBody))
 	} else {
 		slog.Debug("remap translated body", "reqID", reqID, "body", string(translatedBody[:1000])+"...", "totalBytes", len(translatedBody))
 	}
 
-	slog.Info("remap request", "reqID", reqID, "targetURL", targetURL, "model", mapping.TargetModel, "stream", streaming)
+	slog.Info("remap request", "reqID", reqID, "targetURL", targetURL, "model", remap.To, "stream", streaming)
 
 	// Make the request
-	resp, err := ph.httpClient.Do(outReq)
+	resp, err := ph.gateway.Do(outReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"upstream request failed: %s"}`, err.Error()), http.StatusBadGateway)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprintf(w, `{"error":"provider_unavailable","message":"Provider backend error: %s"}`, err.Error())
 		slog.Error("upstream request failed", "reqID", reqID, "error", err)
 		ph.metrics.errors.Add(1)
 		return
@@ -181,9 +153,9 @@ func (ph *ProxyHandler) handleRemappedRequest(w http.ResponseWriter, r *http.Req
 	defer resp.Body.Close()
 
 	if !streaming {
-		ph.handleNonStreamingResponse(w, resp, reqID, mapping, start)
+		ph.handleNonStreamingResponse(w, resp, reqID, remap, start)
 	} else {
-		ph.handleStreamingResponse(w, resp, reqID, mapping, start)
+		ph.handleStreamingResponse(w, resp, reqID, remap, start)
 	}
 }
 
@@ -279,14 +251,13 @@ func validateOpenAIToolResults(translatedReq map[string]interface{}) error {
 	return nil
 }
 
-func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, mapping ModelMapping, start time.Time) {
+func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, remap ModelRemapConfig, start time.Time) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, `{"error":"failed to read upstream response"}`, http.StatusBadGateway)
 		return
 	}
 
-	// If upstream returned an error, log it and pass it through
 	if resp.StatusCode >= 400 {
 		slog.Error("upstream error", "reqID", reqID, "status", resp.StatusCode, "body", string(respBody))
 		ph.metrics.errors.Add(1)
@@ -303,7 +274,6 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 
 	var upstreamResp map[string]interface{}
 	if err := json.Unmarshal(respBody, &upstreamResp); err != nil {
-		// Can't parse — just forward raw
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		w.Write(respBody)
@@ -311,14 +281,13 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 	}
 
 	var translated []byte
-	switch mapping.TargetProvider {
+	switch remap.Provider {
 	case "anthropic":
 		translated, err = translateAnthropicToGoogle(upstreamResp)
 	case "openai":
 		translated, err = translateOpenAIToGoogle(upstreamResp)
 	}
 	if err != nil {
-		// Fallback: forward raw response
 		slog.Warn("response translation failed, forwarding raw", "reqID", reqID, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
@@ -332,7 +301,7 @@ func (ph *ProxyHandler) handleNonStreamingResponse(w http.ResponseWriter, resp *
 	slog.Info("response remap", "reqID", reqID, "status", 200, "statusText", "OK", "bytes", len(translated), "elapsed", time.Since(start).Round(time.Millisecond))
 }
 
-func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, mapping ModelMapping, start time.Time) {
+func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *http.Response, reqID uint64, remap ModelRemapConfig, start time.Time) {
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
 		w.WriteHeader(resp.StatusCode)
@@ -357,7 +326,6 @@ func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *htt
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Track event type for Anthropic SSE (event: xxx)
 		if strings.HasPrefix(line, "event: ") {
 			eventType = strings.TrimPrefix(line, "event: ")
 			continue
@@ -368,7 +336,6 @@ func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *htt
 		}
 		data := strings.TrimPrefix(line, "data: ")
 
-		// OpenAI stream terminator
 		if data == "[DONE]" {
 			break
 		}
@@ -380,7 +347,7 @@ func (ph *ProxyHandler) handleStreamingResponse(w http.ResponseWriter, resp *htt
 
 		var googleChunk []byte
 		var err error
-		switch mapping.TargetProvider {
+		switch remap.Provider {
 		case "anthropic":
 			googleChunk, err = translateAnthropicStreamChunk(chunk, eventType)
 		case "openai":

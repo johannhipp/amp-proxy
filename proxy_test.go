@@ -1,63 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-func newTestConfig(vibeproxyURL, ampcodeURL string) *Config {
-	config := NewDefaultConfig()
-	config.DefaultTarget = ampcodeURL
-	config.VibeProxyTarget = vibeproxyURL
-	for i := range config.Rules {
-		switch config.Rules[i].Name {
-		case "provider-to-vibeproxy":
-			config.Rules[i].Target = vibeproxyURL
-		}
-	}
-	return config
-}
-
-func TestProviderRequestsGoToVibeProxy(t *testing.T) {
-	vibeproxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("vibeproxy"))
-	}))
-	defer vibeproxy.Close()
-
-	ampcode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ampcode"))
-	}))
-	defer ampcode.Close()
-
-	config := newTestConfig(vibeproxy.URL, ampcode.URL)
-	handler := NewProxyHandler(config)
-
-	paths := []string{
-		"/api/provider/anthropic",
-		"/api/provider/openai/v1",
-		"/api/provider/google",
-		"/v1/messages",
-		"/api/v1/chat/completions",
-	}
-
-	for _, path := range paths {
-		req := httptest.NewRequest("POST", "http://localhost"+path, nil)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, req)
-
-		if w.Body.String() != "vibeproxy" {
-			t.Errorf("Path %s: expected vibeproxy, got %s (status %d)", path, w.Body.String(), w.Code)
-		}
-	}
-}
-
 func TestAuthRequestsRedirectToAmpcode(t *testing.T) {
-	config := NewDefaultConfig()
-	config.DefaultTarget = "https://ampcode.com"
-	handler := NewProxyHandler(config)
+	cfg := DefaultConfig()
+	cfg.AmpcodeURL = "https://ampcode.com"
+	handler := &ProxyHandler{
+		config: cfg,
+		httpClient: &http.Client{},
+	}
 
 	tests := []struct {
 		path             string
@@ -83,109 +39,168 @@ func TestAuthRequestsRedirectToAmpcode(t *testing.T) {
 	}
 }
 
-func TestNonAuthDefaultRequestsGoToAmpcode(t *testing.T) {
-	vibeproxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("vibeproxy"))
-	}))
-	defer vibeproxy.Close()
-
-	ampcode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ampcode"))
-	}))
-	defer ampcode.Close()
-
-	config := newTestConfig(vibeproxy.URL, ampcode.URL)
-	handler := NewProxyHandler(config)
-
-	paths := []string{
-		"/api/internal/github-auth-status",
-		"/api/internal/github-proxy/repos",
+func TestHealthCheck(t *testing.T) {
+	cfg := DefaultConfig()
+	handler := &ProxyHandler{
+		config: cfg,
+		httpClient: &http.Client{},
 	}
 
-	for _, path := range paths {
-		req := httptest.NewRequest("GET", "http://localhost"+path, nil)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, req)
+	req := httptest.NewRequest("GET", "http://localhost/healthz", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
 
-		if w.Body.String() != "ampcode" {
-			t.Errorf("Path %s: expected ampcode, got %s (status %d)", path, w.Body.String(), w.Code)
-		}
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if w.Body.String() != `{"status":"ok"}` {
+		t.Errorf("unexpected body: %s", w.Body.String())
 	}
 }
 
-func TestDefaultRequestsGoToAmpcode(t *testing.T) {
-	vibeproxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("vibeproxy"))
-	}))
-	defer vibeproxy.Close()
-
-	ampcode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ampcode"))
-	}))
-	defer ampcode.Close()
-
-	config := newTestConfig(vibeproxy.URL, ampcode.URL)
-	handler := NewProxyHandler(config)
-
-	// Everything that's not an LLM provider path goes to ampcode
-	paths := []string{
-		"/api/threads",
-		"/api/threads/sync",
-		"/api/session",
-		"/api/sessions",
-		"/api/telemetry",
-		"/api/events",
-		"/api/attachments",
-		"/api/durable-thread-workers",
-		"/api/internal",
-		"/threads/T-some-thread-id",
-		"/settings",
+func TestGetUserFreeTierStatus(t *testing.T) {
+	cfg := DefaultConfig()
+	handler := &ProxyHandler{
+		config: cfg,
+		httpClient: &http.Client{},
 	}
 
-	for _, path := range paths {
-		req := httptest.NewRequest("GET", "http://localhost"+path, nil)
-		w := httptest.NewRecorder()
-		handler.ServeHTTP(w, req)
+	req := httptest.NewRequest("GET", "http://localhost/api/internal?getUserFreeTierStatus", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
 
-		if w.Body.String() != "ampcode" {
-			t.Errorf("Path %s: expected ampcode, got %s (status %d)", path, w.Body.String(), w.Code)
-		}
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if w.Body.String() != `{"ok":true,"result":{"canUseAmpFree":true,"isDailyGrantEnabled":true}}` {
+		t.Errorf("unexpected body: %s", w.Body.String())
 	}
 }
 
-func TestFindTarget(t *testing.T) {
-	config := NewDefaultConfig()
-	handler := NewProxyHandler(config)
-
+func TestIsProviderRequest(t *testing.T) {
 	tests := []struct {
 		path   string
-		expect string
+		expect bool
 	}{
-		// LLM paths -> vibeproxy
-		{"/api/provider/anthropic", config.VibeProxyTarget},
-		{"/api/provider/openai/v1", config.VibeProxyTarget},
-		{"/v1/messages", config.VibeProxyTarget},
-		{"/api/v1/chat/completions", config.VibeProxyTarget},
-		// Everything else -> ampcode
-		{"/auth/cli-login", config.DefaultTarget},
-		{"/api/auth/sign-in", config.DefaultTarget},
-		{"/api/internal/github-auth-status", config.DefaultTarget},
-		{"/api/threads", config.DefaultTarget},
-		{"/api/session", config.DefaultTarget},
-		{"/threads/T-abc-123", config.DefaultTarget},
-		{"/settings", config.DefaultTarget},
+		{"/api/provider/anthropic", true},
+		{"/api/provider/openai/v1", true},
+		{"/api/provider/google", true},
+		{"/v1/messages", true},
+		{"/api/v1/chat/completions", true},
+		{"/api/threads", false},
+		{"/auth/cli-login", false},
+		{"/api/internal", false},
+		{"/settings", false},
 	}
 
 	for _, tt := range tests {
 		req := httptest.NewRequest("GET", "http://localhost"+tt.path, nil)
-		target := handler.findTarget(req)
-
-		if target != tt.expect {
-			t.Errorf("Path %s: expected %s, got %s", tt.path, tt.expect, target)
+		got := isProviderRequest(req)
+		if got != tt.expect {
+			t.Errorf("isProviderRequest(%s): expected %v, got %v", tt.path, tt.expect, got)
 		}
+	}
+}
+
+func TestStripCacheControl(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+		changed  bool
+	}{
+		{
+			name:     "removes top-level cache_control",
+			input:    `{"model":"test","cache_control":{"type":"ephemeral"},"max_tokens":100}`,
+			expected: `{"max_tokens":100,"model":"test"}`,
+			changed:  true,
+		},
+		{
+			name:     "removes nested cache_control",
+			input:    `{"messages":[{"role":"user","content":"hi","cache_control":{"type":"ephemeral"}}]}`,
+			expected: `{"messages":[{"content":"hi","role":"user"}]}`,
+			changed:  true,
+		},
+		{
+			name:     "no change when no cache_control",
+			input:    `{"model":"test","max_tokens":100}`,
+			expected: `{"model":"test","max_tokens":100}`,
+			changed:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var m map[string]interface{}
+			if err := json.Unmarshal([]byte(tt.input), &m); err != nil {
+				t.Fatal(err)
+			}
+			changed := removeCacheControl(m)
+			if changed != tt.changed {
+				t.Errorf("removeCacheControl changed=%v, expected %v", changed, tt.changed)
+			}
+		})
+	}
+}
+
+func TestConfigDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.ListenPort != 18317 {
+		t.Errorf("expected default port 18317, got %d", cfg.ListenPort)
+	}
+	if cfg.ListenAddr != "127.0.0.1" {
+		t.Errorf("expected default addr 127.0.0.1, got %s", cfg.ListenAddr)
+	}
+	if cfg.AmpcodeURL != "https://ampcode.com" {
+		t.Errorf("expected default ampcode URL, got %s", cfg.AmpcodeURL)
+	}
+	if cfg.AuthDir != "~/.cli-proxy-api" {
+		t.Errorf("expected default auth dir ~/.cli-proxy-api, got %s", cfg.AuthDir)
+	}
+	if len(cfg.ModelRemaps) != 4 {
+		t.Errorf("expected 4 default model remaps, got %d", len(cfg.ModelRemaps))
+	}
+}
+
+func TestFindModelRemap(t *testing.T) {
+	cfg := DefaultConfig()
+
+	tests := []struct {
+		model      string
+		wantTo     string
+		wantProv   string
+		wantExact  bool
+	}{
+		{"gemini-3-flash-preview", "claude-sonnet-4-6", "anthropic", true},
+		{"gemini-3-pro", "gpt-5.4", "openai", true},
+		{"unknown-model", "claude-sonnet-4-6", "anthropic", false},
+	}
+
+	for _, tt := range tests {
+		remap, exact := cfg.FindModelRemap(tt.model)
+		if remap.To != tt.wantTo {
+			t.Errorf("FindModelRemap(%s): expected to=%s, got %s", tt.model, tt.wantTo, remap.To)
+		}
+		if remap.Provider != tt.wantProv {
+			t.Errorf("FindModelRemap(%s): expected provider=%s, got %s", tt.model, tt.wantProv, remap.Provider)
+		}
+		if exact != tt.wantExact {
+			t.Errorf("FindModelRemap(%s): expected exact=%v, got %v", tt.model, tt.wantExact, exact)
+		}
+	}
+}
+
+func TestExpandEnvVars(t *testing.T) {
+	t.Setenv("TEST_VAR", "hello")
+	result := expandEnvVars("key: ${TEST_VAR}")
+	if result != "key: hello" {
+		t.Errorf("expected 'key: hello', got %q", result)
+	}
+
+	// Unset var should remain as-is
+	result = expandEnvVars("key: ${NONEXISTENT_VAR}")
+	if result != "key: ${NONEXISTENT_VAR}" {
+		t.Errorf("expected unchanged, got %q", result)
 	}
 }
