@@ -46,7 +46,7 @@ func translateGoogleToAnthropic(googleReq map[string]interface{}, model string, 
 		if maxTokens, ok := genConfig["maxOutputTokens"].(float64); ok {
 			mt := int(maxTokens)
 			// Cap to Anthropic model limits:
-			// Opus 4.6: 128k, Sonnet 4.6: 64k, Haiku 4.5: 64k
+			// Opus 4.7: 128k, Sonnet 4.6: 64k, Haiku 4.5: 64k
 			if mt > 64000 {
 				mt = 64000
 			}
