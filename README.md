@@ -93,6 +93,8 @@ gemini       ✗ not authed  -                    -
 
 Tokens are stored in `~/.cli-proxy-api/` — compatible with vibeproxy, so existing tokens carry over.
 
+If amp-proxy was already running when you logged in, restart it — tokens are loaded at startup, so new ones added mid-run aren't picked up until restart.
+
 ## Usage
 
 ```bash
@@ -214,6 +216,15 @@ make dev     # run without building
 make fmt     # format code
 make vet     # run go vet
 ```
+
+When running from source (`make dev` / `go run .`), `amp-proxy login` shells out to `cli-proxy-api-plus`, which the install script normally provides. To use `login` in dev mode, install the binary yourself:
+
+```bash
+go install github.com/router-for-me/CLIProxyAPI/v6/cmd/server@latest
+ln -sf ~/go/bin/server ~/go/bin/cli-proxy-api-plus
+```
+
+Make sure `~/go/bin` is on your `PATH`. Or just run `./bin/install.sh` once to get a released `cli-proxy-api-plus` into `~/.local/bin`.
 
 ## Migrating from vibeproxy
 
