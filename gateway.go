@@ -232,8 +232,16 @@ type cliproxyRemoteMgmt struct {
 }
 
 type cliproxyAmpcode struct {
-	UpstreamURL                   string `yaml:"upstream-url"`
-	RestrictManagementToLocalhost bool   `yaml:"restrict-management-to-localhost"`
+	UpstreamURL                   string                    `yaml:"upstream-url"`
+	RestrictManagementToLocalhost bool                      `yaml:"restrict-management-to-localhost"`
+	ModelMappings                 []cliproxyAmpModelMapping `yaml:"model-mappings,omitempty"`
+	ForceModelMappings            bool                      `yaml:"force-model-mappings,omitempty"`
+}
+
+type cliproxyAmpModelMapping struct {
+	From  string `yaml:"from"`
+	To    string `yaml:"to"`
+	Regex bool   `yaml:"regex,omitempty"`
 }
 
 type cliproxyQuotaExceeded struct {
@@ -271,11 +279,20 @@ func (gw *ProviderGateway) writeConfig(appCfg *AppConfig) (string, error) {
 		Ampcode: cliproxyAmpcode{
 			UpstreamURL:                   appCfg.AmpcodeURL,
 			RestrictManagementToLocalhost: true,
+			ForceModelMappings:            appCfg.AmpcodeForceModelMappings,
 		},
 		QuotaExceeded: cliproxyQuotaExceeded{
 			SwitchProject:      true,
 			SwitchPreviewModel: true,
 		},
+	}
+
+	for _, m := range appCfg.AmpcodeModelMappings {
+		cfg.Ampcode.ModelMappings = append(cfg.Ampcode.ModelMappings, cliproxyAmpModelMapping{
+			From:  m.From,
+			To:    m.To,
+			Regex: m.Regex,
+		})
 	}
 
 	if appCfg.RequestTimeoutMins > 0 {

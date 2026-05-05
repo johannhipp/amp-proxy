@@ -56,6 +56,20 @@
 #   to: claude-sonnet-4-6
 #   provider: anthropic
 
+# Ampcode model mappings — route Claude models through your local OAuth provider
+# instead of forwarding to ampcode.com (which uses amp credits).
+# Useful when Amp requests a Claude model your subscription doesn't include but
+# can be served by an alternative model on the same OAuth (e.g. opus-4-7 → opus-4-6).
+# Plumbed into cliproxy-internal.yaml as ampcode.model-mappings.
+# ampcode_model_mappings:
+#   - from: claude-opus-4-7
+#     to: claude-opus-4-6
+#
+# When force-mode is enabled, mappings take precedence over local API keys for
+# the matched model — required if you want Amp's Claude requests to be served
+# by your OAuth subscription rather than billed to ampcode credits.
+# ampcode_force_model_mappings: true
+
 # Strip cache_control fields from request bodies (default: true)
 # Prevents 400 errors on some OAuth routes, but disables Anthropic prompt caching.
 # Set to false to enable prompt caching (reduces token usage in long sessions).
