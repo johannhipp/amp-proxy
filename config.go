@@ -35,6 +35,12 @@ type AppConfig struct {
 	// Fallback for unmapped models
 	Fallback *ModelRemapConfig `yaml:"fallback"`
 
+	// Ampcode model mappings — route Claude models to local OAuth provider
+	// instead of forwarding to ampcode.com (which uses amp credits).
+	// Plumbed into cliproxy-internal.yaml as ampcode.model-mappings.
+	AmpcodeModelMappings      []AmpModelMapping `yaml:"ampcode_model_mappings"`
+	AmpcodeForceModelMappings bool              `yaml:"ampcode_force_model_mappings"`
+
 	// CLIProxyAPIPlus-specific config overrides
 	RequestRetry        int `yaml:"request_retry"`
 	RequestTimeoutMins  int `yaml:"request_timeout_mins"`
@@ -59,6 +65,13 @@ type ModelRemapConfig struct {
 	From     string `yaml:"from"`
 	To       string `yaml:"to"`
 	Provider string `yaml:"provider"` // "anthropic" or "openai"
+}
+
+// AmpModelMapping mirrors CLIProxyAPI's ampcode.model-mappings entry.
+type AmpModelMapping struct {
+	From  string `yaml:"from"`
+	To    string `yaml:"to"`
+	Regex bool   `yaml:"regex,omitempty"`
 }
 
 // APIKeyConfig holds a direct API key configuration
